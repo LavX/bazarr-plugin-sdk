@@ -76,6 +76,8 @@ EXIT_ENVIRONMENT = 2
 EXIT_PROTOCOL = 76
 EXIT_CONTRACT_NOT_SERVED = 78
 
+RESULT_LIMIT_MESSAGE = "the result body exceeds the result limit"
+
 _TEMP_VARIABLES = ("TMPDIR", "TMP", "TEMP")
 
 
@@ -612,7 +614,7 @@ class _Worker:
         result = _coerce_result(value)
         body = result.body
         if body is not None and len(body) > self._limits.result_limit(len(request.body or b"")):
-            raise PluginError(INTERNAL, "the result body exceeds the result limit")
+            raise PluginError(INTERNAL, RESULT_LIMIT_MESSAGE)
         frame: dict[str, Any] = {
             "t": "result",
             "op": op,

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 from sample_plugin import SamplePlugin
 
-from bazarr_plugin_sdk.testing import run_conformance
+from bazarr_plugin_sdk.testing import FakeHost, run_conformance
+from bazarr_plugin_sdk.testing.conformance import CheckResult, ConformanceReport
 
 FIXTURES = {
     "valid": {"method": "echo", "params": {"text": "hi"}, "body": b"abc"},
@@ -73,3 +75,57 @@ def test_report_describes_each_result(tmp_path: Path) -> None:
     text = report.describe()
     assert "handshake agreement" in text
     assert "SKIP" in text
+    assert f"{len(report.skipped)} skipped" in text
+
+
+def named(report: ConformanceReport, name: str) -> CheckResult:
+    return next(result for result in report.results if result.name == name)
+
+
+def test_an_empty_fixture_set_fails(tmp_path: Path) -> None:
+    report = run_conformance(SamplePlugin, "sample.v1", {}, root=tmp_path)
+    assert not report.ok
+    assert named(report, "fixtures given").status == "fail"
+
+
+def test_skipped_checks_are_never_counted_as_passes(tmp_path: Path) -> None:
+    report = run_conformance(
+        SamplePlugin,
+        "sample.v1",
+        {"valid": {"method": "echo", "params": {"text": "hi"}}},
+        root=tmp_path,
+    )
+    passed = {result.name for result in report.passed}
+    skipped = {result.name for result in report.skipped}
+    assert "cancel mid-call" in skipped
+    assert not passed & skipped
+
+
+def test_a_secret_stored_in_a_checkpoint_fails_the_secrets_check(tmp_path: Path) -> None:
+    fixtures = {**FIXTURES, "valid": {"method": "leak_checkpoint"}}
+    report = run_conformance(SamplePlugin, "sample.v1", fixtures, root=tmp_path)
+    result = named(report, "secrets only in the secrets object")
+    assert result.status == "fail"
+    assert "secret" in result.detail
+
+
+def test_cancel_check_requires_the_cancel_frame_to_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def record_without_writing(self: FakeHost, op: str, *, abandon: bool = False) -> None:
+        self.cancel_times[op] = time.monotonic()
+
+    monkeypatch.setattr(FakeHost, "cancel", record_without_writing)
+    fixtures = {**FIXTURES, "cancel": {"method": "self_cancel"}}
+    report = run_conformance(SamplePlugin, "sample.v1", fixtures, root=tmp_path)
+    result = named(report, "cancel mid-call")
+    assert result.status == "fail"
+    assert "never written" in result.detail
+
+
+def test_oversize_check_requires_the_result_limit_refusal(tmp_path: Path) -> None:
+    fixtures = {**FIXTURES, "oversize": {"method": "boom"}}
+    report = run_conformance(SamplePlugin, "sample.v1", fixtures, root=tmp_path)
+    result = named(report, "oversize result refused")
+    assert result.status == "fail"
+    assert "result limit" in result.detail

@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 from bazarr_plugin_sdk import Plugin, PluginContext, PluginError, Request, Result
-from bazarr_plugin_sdk.errors import DECLINED, INVALID_CONFIG
+from bazarr_plugin_sdk.errors import CANCELLED, DECLINED, INVALID_CONFIG
 
 MIB = 1024 * 1024
 
@@ -30,6 +30,8 @@ class SamplePlugin(Plugin):
         "declined",
         "invalid_config",
         "folders",
+        "leak_checkpoint",
+        "self_cancel",
     )
 
     async def echo(self, ctx: PluginContext, request: Request) -> Result:
@@ -87,3 +89,13 @@ class SamplePlugin(Plugin):
             "temp_dir": str(ctx.temp_dir),
             "artifacts_dir": str(ctx.artifacts_dir),
         }
+
+    async def leak_checkpoint(self, ctx: PluginContext, request: Request) -> dict[str, bool]:
+        # Deliberately stores a credential in a checkpoint, for the secrets check.
+        await ctx.checkpoint(request.secrets.get("conformance_api_key", "none").encode())
+        return {}
+
+    async def self_cancel(self, ctx: PluginContext, request: Request) -> None:
+        # Gives up with the cancelled code without reading the host's cancel flag.
+        await asyncio.sleep(0.5)
+        raise PluginError(CANCELLED, "gave up")

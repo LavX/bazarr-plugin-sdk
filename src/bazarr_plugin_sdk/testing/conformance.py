@@ -20,6 +20,7 @@ with ``method`` (text), and optionally ``params`` (a mapping) and ``body``
 
 from __future__ import annotations
 
+import base64
 import json
 import secrets
 import tempfile
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from ..plugin import Plugin
+from ..runtime import RESULT_LIMIT_MESSAGE
 from ..wire import PROTOCOL_VERSION
 from .fake_host import CallOutcome, FakeHost
 
@@ -45,6 +47,7 @@ __all__ = [
 ]
 
 SECRET_SENTINEL = "conformance-" + secrets.token_hex(16)
+_SECRET_BYTES = SECRET_SENTINEL.encode()
 CONFORMANCE_HEARTBEAT_INTERVAL = 1.0
 CANCEL_BUDGET_SECONDS = 5.0
 STALL_INTERVALS = 3
@@ -77,6 +80,15 @@ class ConformanceReport:
     def failures(self) -> list[CheckResult]:
         return [result for result in self.results if result.status == "fail"]
 
+    @property
+    def passed(self) -> list[CheckResult]:
+        return [result for result in self.results if result.status == "pass"]
+
+    @property
+    def skipped(self) -> list[CheckResult]:
+        """Checks that did not run. They are never counted as passes."""
+        return [result for result in self.results if result.status == "skip"]
+
     def describe(self) -> str:
         lines = []
         for result in self.results:
@@ -84,6 +96,9 @@ class ConformanceReport:
             if result.detail:
                 line += f": {result.detail}"
             lines.append(line)
+        lines.append(
+            f"{len(self.passed)} passed, {len(self.failures)} failed, {len(self.skipped)} skipped"
+        )
         return "\n".join(lines)
 
 
@@ -160,6 +175,18 @@ class _Suite:
 
     def run(self) -> ConformanceReport:
         report = ConformanceReport()
+        if self._fixtures:
+            report.results.append(
+                CheckResult("fixtures given", "pass", f"{len(self._fixtures)} fixture(s)")
+            )
+        else:
+            report.results.append(
+                CheckResult(
+                    "fixtures given",
+                    "fail",
+                    "no fixtures were given, so every check that makes a call is skipped",
+                )
+            )
         checks = [
             ("handshake agreement", self.check_handshake),
             ("folders fixed for the worker", self.check_folders),
@@ -239,8 +266,20 @@ class _Suite:
         for frame in host.received:
             if SECRET_SENTINEL in json.dumps(frame):
                 return "fail", f"the worker sent the secret in a {frame.get('t')} frame"
-        if outcome.body is not None and SECRET_SENTINEL.encode() in outcome.body:
+        # Chunk data is base64 on the wire, so the scan works on the decoded bytes.
+        # Joining the chunks also catches a secret split across two chunks.
+        decoded_chunks = b"".join(
+            base64.b64decode(str(frame.get("data", "")))
+            for frame in host.received
+            if frame.get("t") == "chunk"
+        )
+        if _SECRET_BYTES in decoded_chunks:
+            return "fail", "the worker sent the secret in a body chunk"
+        if outcome.body is not None and _SECRET_BYTES in outcome.body:
             return "fail", "the worker sent the secret in a result body"
+        for body in host.checkpoints:
+            if _SECRET_BYTES in body:
+                return "fail", "the worker stored the secret in a checkpoint"
         return "pass", ""
 
     def check_cancel(self) -> tuple[str, str]:
@@ -271,8 +310,13 @@ class _Suite:
         if outcome.kind != "error" or outcome.code != "cancelled":
             return "fail", f"expected cancelled, got {outcome.kind} {outcome.code}"
         sent_at = host.cancel_times.get(op)
-        if sent_at is None:
-            return "fail", "the cancel was never sent"
+        cancel_written = any(
+            frame.get("t") == "cancel" and frame.get("op") == op for frame in host.sent
+        )
+        if sent_at is None or not cancel_written:
+            return "fail", "the cancel frame was never written to the worker"
+        if outcome.finished_at < sent_at:
+            return "fail", "the call ended before the cancel was sent, so it did not answer it"
         elapsed = outcome.finished_at - sent_at
         if elapsed > CANCEL_BUDGET_SECONDS:
             return "fail", f"the call ended {elapsed:.1f} seconds after the cancel"
@@ -334,6 +378,9 @@ class _Suite:
             return "fail", f"the worker broke the framing: {outcome.detail}"
         if outcome.kind != "error" or outcome.code != "internal":
             return "fail", f"expected internal, got {outcome.kind} {outcome.code}"
+        message = str(outcome.frame.get("message", "")) if outcome.frame else ""
+        if message != RESULT_LIMIT_MESSAGE:
+            return "fail", f"expected the result limit refusal, got {message!r}"
         return "pass", ""
 
     def check_stderr_secrets(self) -> CheckResult:
@@ -365,7 +412,7 @@ def run_conformance(
 
     Use it from a test::
 
-        report = run_conformance(MyPlugin, "translator.v1", FIXTURES)
+        report = run_conformance(MyPlugin, "example.kind.v1", FIXTURES)
         assert report.ok, report.describe()
     """
     cases = _normalise(fixtures or {})
