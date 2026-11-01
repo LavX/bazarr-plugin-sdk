@@ -1,18 +1,17 @@
 name: publish
 
 # Publishing uses PyPI trusted publishing: no API token is stored in the
-# repository. Each publish job runs in a GitHub environment. The "pypi" and
-# "testpypi" environments must be configured in the repository settings with
-# the trusted publisher for this workflow and with required reviewers, so that
-# a person approves each upload before it starts.
+# repository. The publish job runs in the "pypi" GitHub environment. That
+# environment must be configured in the repository settings with the trusted
+# publisher for this workflow and with required reviewers, so that a person
+# approves each upload before it starts.
 #
-# A tag push named v* publishes to PyPI. A manual run publishes to TestPyPI.
-# Attestations (PEP 740) are generated for each upload.
+# Only a tag push named v* publishes, and only when the tag matches the
+# package version. Attestations (PEP 740) are generated for each upload.
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -28,6 +27,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check the tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/bazarr_plugin_sdk/_version.py)"
+          if [ -z "$version" ] || [ "$tag" != "$version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match __version__ '${version}'" >&2
+            exit 1
+          fi
       - name: Build
         run: |
           python -m pip install build
@@ -37,26 +44,6 @@ jobs:
           name: dist
           path: dist/
           if-no-files-found: error
-
-  publish-testpypi:
-    name: publish to TestPyPI
-    if: github.event_name == 'workflow_dispatch'
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: testpypi
-      url: https://test.pypi.org/project/bazarr-plugin-sdk/
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          attestations: true
 
   publish-pypi:
     name: publish to PyPI
