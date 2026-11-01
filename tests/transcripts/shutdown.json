@@ -1,0 +1,14 @@
+{
+  "name": "shutdown",
+  "description": "The host asks the worker to stop. The frame carries the empty connection-level operation id. The worker cancels its operations and exits with status 0.",
+  "kind": "frames",
+  "frames": [
+    {
+      "from": "host",
+      "frame": {
+        "t": "shutdown",
+        "op": ""
+      }
+    }
+  ]
+}

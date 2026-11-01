@@ -1,0 +1,28 @@
+{
+  "name": "internal_error",
+  "description": "An exception that is not a PluginError reaches the host as an error of code internal. The message is the class name, a colon, the text, cut to 500 characters. The traceback is never on the wire.",
+  "kind": "frames",
+  "frames": [
+    {
+      "from": "host",
+      "frame": {
+        "t": "call",
+        "op": "op-8",
+        "method": "boom",
+        "params": {},
+        "secrets": {},
+        "budget": {},
+        "body": false
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "error",
+        "op": "op-8",
+        "code": "internal",
+        "message": "ValueError: boom"
+      }
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "name": "handshake",
+  "description": "The host sends hello and the worker answers hello_ack with the kind it serves, the operations it declares and the folders it will use.",
+  "kind": "frames",
+  "frames": [
+    {
+      "from": "host",
+      "frame": {
+        "t": "hello",
+        "op": "",
+        "protocol": 1,
+        "kind_api": "sample.v1",
+        "host_version": "1.0.0",
+        "limits": {
+          "control_frame_bytes": 65536,
+          "chunk_bytes": 1048576,
+          "request_body_bytes": 16777216,
+          "result_body_bytes": 16777216,
+          "result_floor_bytes": 1048576,
+          "result_factor": 4,
+          "checkpoint_bytes": 8388608
+        },
+        "heartbeat_interval": 10,
+        "max_in_flight": 1,
+        "folders": {
+          "data_dir": "/srv/plugin/data",
+          "temp_dir": "/srv/plugin/tmp",
+          "artifacts_dir": "/srv/plugin/artifacts"
+        }
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "hello_ack",
+        "op": "",
+        "protocol": 1,
+        "sdk_version": "0.1.0",
+        "kind_apis": ["sample.v1"],
+        "operations": ["echo"],
+        "folders": {
+          "data_dir": "/srv/plugin/data",
+          "temp_dir": "/srv/plugin/tmp",
+          "artifacts_dir": "/srv/plugin/artifacts"
+        },
+        "environment": {
+          "TMPDIR": "/srv/plugin/tmp",
+          "TMP": "/srv/plugin/tmp",
+          "TEMP": "/srv/plugin/tmp"
+        }
+      }
+    }
+  ]
+}

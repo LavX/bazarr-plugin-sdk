@@ -1,0 +1,72 @@
+{
+  "name": "chunked_body",
+  "description": "A request body and a result body each travel as two chunks. The first chunk carries seq 0 and last false, the second carries seq 1 and last true. The bytes are b'hel' followed by b'lo'.",
+  "kind": "frames",
+  "frames": [
+    {
+      "from": "host",
+      "frame": {
+        "t": "call",
+        "op": "op-4",
+        "method": "echo",
+        "params": {},
+        "secrets": {},
+        "budget": {},
+        "body": true
+      }
+    },
+    {
+      "from": "host",
+      "frame": {
+        "t": "chunk",
+        "op": "op-4",
+        "of": "call",
+        "seq": 0,
+        "last": false,
+        "data": "aGVs"
+      }
+    },
+    {
+      "from": "host",
+      "frame": {
+        "t": "chunk",
+        "op": "op-4",
+        "of": "call",
+        "seq": 1,
+        "last": true,
+        "data": "bG8="
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "result",
+        "op": "op-4",
+        "value": {"body_length": 5},
+        "body": true
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "chunk",
+        "op": "op-4",
+        "of": "result",
+        "seq": 0,
+        "last": false,
+        "data": "aGVs"
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "chunk",
+        "op": "op-4",
+        "of": "result",
+        "seq": 1,
+        "last": true,
+        "data": "bG8="
+      }
+    }
+  ]
+}

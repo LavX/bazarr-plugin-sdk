@@ -1,0 +1,46 @@
+{
+  "name": "cancel_mid_call",
+  "description": "The host cancels a running call. The worker answers with an error of code cancelled and no result. The worker stays alive for the next call.",
+  "kind": "frames",
+  "frames": [
+    {
+      "from": "host",
+      "frame": {
+        "t": "call",
+        "op": "op-2",
+        "method": "slow",
+        "params": {},
+        "secrets": {},
+        "budget": {},
+        "body": false
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "progress",
+        "op": "op-2",
+        "done": 0,
+        "total": 10,
+        "message": "starting"
+      }
+    },
+    {
+      "from": "host",
+      "frame": {
+        "t": "cancel",
+        "op": "op-2",
+        "abandon": false
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "error",
+        "op": "op-2",
+        "code": "cancelled",
+        "message": "operation cancelled"
+      }
+    }
+  ]
+}

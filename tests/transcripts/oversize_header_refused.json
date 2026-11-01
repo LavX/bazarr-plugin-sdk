@@ -1,0 +1,10 @@
+{
+  "name": "oversize_header_refused",
+  "description": "A length prefix of 2,000,000 bytes (hex 001e8480) is above the channel limit of 1,463,640 bytes. The reader refuses the frame after consuming the four prefix bytes and before any body byte is read. The body that follows is never consumed.",
+  "kind": "refuse",
+  "header_hex": "001e8480",
+  "expect": {
+    "error": "FrameTooLarge",
+    "bytes_consumed": 4
+  }
+}

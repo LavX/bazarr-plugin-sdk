@@ -1,0 +1,37 @@
+{
+  "name": "error_frames",
+  "description": "Error frames carry one of the nine codes. The optional fields follow their code: field_errors for invalid_config, retry_after for rate_limited, reason for declined.",
+  "kind": "frames",
+  "frames": [
+    {
+      "from": "worker",
+      "frame": {
+        "t": "error",
+        "op": "op-5",
+        "code": "invalid_config",
+        "message": "the configuration is incomplete",
+        "field_errors": {"api_key": "required"}
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "error",
+        "op": "op-6",
+        "code": "rate_limited",
+        "message": "slow down",
+        "retry_after": 30
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "error",
+        "op": "op-7",
+        "code": "declined",
+        "message": "the source language is not supported",
+        "reason": "unsupported_language"
+      }
+    }
+  ]
+}

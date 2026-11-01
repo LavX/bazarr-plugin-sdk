@@ -1,0 +1,45 @@
+{
+  "name": "call_result",
+  "description": "One call with no body. The worker reports progress and a heartbeat, then returns a result with a JSON value and no body.",
+  "kind": "frames",
+  "frames": [
+    {
+      "from": "host",
+      "frame": {
+        "t": "call",
+        "op": "op-1",
+        "method": "echo",
+        "params": {"text": "hi"},
+        "secrets": {"api_key": "value-held-only-here"},
+        "budget": {"max_cost": 0.5},
+        "body": false
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "progress",
+        "op": "op-1",
+        "done": 1,
+        "total": 2,
+        "message": "half"
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "heartbeat",
+        "op": "op-1"
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "result",
+        "op": "op-1",
+        "value": {"text": "hi"},
+        "body": false
+      }
+    }
+  ]
+}

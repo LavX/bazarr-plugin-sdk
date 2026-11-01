@@ -1,0 +1,99 @@
+{
+  "name": "reserve_usage_checkpoint",
+  "description": "The worker reserves an amount, reports usage against the reservation and stores a checkpoint. Each awaited request is answered by an ack with the same req. The checkpoint body travels as one chunk.",
+  "kind": "frames",
+  "frames": [
+    {
+      "from": "host",
+      "frame": {
+        "t": "call",
+        "op": "op-3",
+        "method": "reserve_usage",
+        "params": {},
+        "secrets": {},
+        "budget": {},
+        "body": false
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "reserve",
+        "op": "op-3",
+        "req": "1",
+        "amount": 0.01,
+        "model": "model-a"
+      }
+    },
+    {
+      "from": "host",
+      "frame": {
+        "t": "ack",
+        "op": "op-3",
+        "req": "1",
+        "ok": true,
+        "reservation": "res-1"
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "usage",
+        "op": "op-3",
+        "req": "2",
+        "tokens": 10,
+        "cost": 0.001,
+        "model": "model-a",
+        "reservations": ["res-1"]
+      }
+    },
+    {
+      "from": "host",
+      "frame": {
+        "t": "ack",
+        "op": "op-3",
+        "req": "2",
+        "ok": true
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "checkpoint",
+        "op": "op-3",
+        "req": "3",
+        "body": true
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "chunk",
+        "op": "op-3",
+        "of": "checkpoint",
+        "req": "3",
+        "seq": 0,
+        "last": true,
+        "data": "aGVsbG8="
+      }
+    },
+    {
+      "from": "host",
+      "frame": {
+        "t": "ack",
+        "op": "op-3",
+        "req": "3",
+        "ok": true
+      }
+    },
+    {
+      "from": "worker",
+      "frame": {
+        "t": "result",
+        "op": "op-3",
+        "value": {"reservation": "res-1"},
+        "body": false
+      }
+    }
+  ]
+}
