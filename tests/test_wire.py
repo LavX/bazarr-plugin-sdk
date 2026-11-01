@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import struct
+from typing import Any
 
 import pytest
 
@@ -170,20 +171,72 @@ def test_integer_beyond_the_decoder_digit_limit_is_a_frame_error() -> None:
         decode_payload(payload)
 
 
-def test_nesting_too_deep_to_decode_is_a_frame_error() -> None:
-    depth = 30_000
-    payload = b'{"t":"progress","op":"op-1","message":' + b"[" * depth + b"]" * depth + b"}"
-    assert len(payload) < CONTROL_FRAME_BYTES
-    with pytest.raises(FrameError, match="UTF-8 JSON"):
+def nested_result(levels: int) -> dict[str, Any]:
+    """A result frame whose deepest container is at ``levels``, the frame being level 1."""
+    value: list[Any] = []
+    for _ in range(levels - 2):
+        value = [value]
+    return {"t": "result", "op": "op-1", "value": value, "body": False}
+
+
+def test_nesting_of_64_levels_is_accepted_on_encode_and_decode() -> None:
+    frame = nested_result(64)
+    assert reader_for(encode_frame(frame)).read_frame() == frame
+
+
+def test_nesting_of_65_levels_is_refused_on_encode() -> None:
+    with pytest.raises(FrameError, match="64 levels"):
+        encode_frame(nested_result(65))
+
+
+def test_nesting_of_65_levels_is_refused_on_decode() -> None:
+    payload = json.dumps(nested_result(65), separators=(",", ":")).encode("utf-8")
+    with pytest.raises(FrameError, match="64 levels"):
         decode_payload(payload)
 
 
-def test_value_nested_too_deep_to_encode_is_a_frame_error() -> None:
-    value: object = "x"
-    for _ in range(5000):
-        value = [value]
-    with pytest.raises(FrameError, match="not JSON"):
-        encode_frame({"t": "result", "op": "op-1", "value": {"x": value}, "body": False})
+def test_nesting_of_30000_levels_is_refused_on_decode() -> None:
+    depth = 30_000
+    payload = b'{"t":"progress","op":"op-1","message":' + b"[" * depth + b"]" * depth + b"}"
+    assert len(payload) < CONTROL_FRAME_BYTES
+    with pytest.raises(FrameError):
+        decode_payload(payload)
+
+
+def test_unknown_frame_type_message_never_repeats_the_value() -> None:
+    for value in ("teleport", ["secret-token"], {"k": "secret-token"}, 7, None):
+        with pytest.raises(FrameError) as info:
+            validate_frame({"t": value, "op": "op-1"})
+        assert str(info.value) == "unknown frame type"
+
+
+def test_chunk_owner_that_is_not_text_is_a_frame_error() -> None:
+    base = {"t": "chunk", "op": "op-1", "of": "result", "seq": 0, "last": True, "data": ""}
+    for value in ([], {}, ["result"], None, 3):
+        with pytest.raises(FrameError, match="'of'"):
+            validate_frame({**base, "of": value})
+
+
+def test_operation_and_request_ids_are_at_most_256_characters_of_utf8() -> None:
+    validate_frame({"t": "heartbeat", "op": "x" * 256})
+    with pytest.raises(FrameError, match="256"):
+        validate_frame({"t": "heartbeat", "op": "x" * 257})
+    with pytest.raises(FrameError, match="256"):
+        validate_frame({"t": "heartbeat", "op": "\ud800"})
+    with pytest.raises(FrameError, match="256"):
+        decode_payload(b'{"t":"heartbeat","op":"\\ud800"}')
+    validate_frame({"t": "ack", "op": "op-1", "req": "r" * 256, "ok": True})
+    with pytest.raises(FrameError, match="'req'"):
+        validate_frame({"t": "ack", "op": "op-1", "req": "r" * 257, "ok": True})
+    with pytest.raises(FrameError, match="'req'"):
+        validate_frame({"t": "ack", "op": "op-1", "req": "\ud800", "ok": True})
+
+
+def test_connection_frames_must_use_the_empty_operation_id() -> None:
+    for frame_type in ("hello", "hello_ack", "shutdown"):
+        with pytest.raises(FrameError, match="empty operation id"):
+            validate_frame({"t": frame_type, "op": "op-1"})
+    validate_frame({"t": "hello_ack", "op": ""})
 
 
 def test_log_and_host_call_are_reserved_and_not_frame_types() -> None:

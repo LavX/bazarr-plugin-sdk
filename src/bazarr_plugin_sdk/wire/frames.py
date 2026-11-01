@@ -18,7 +18,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any
 
 from .limits import DEFAULT_LIMITS, LENGTH_PREFIX_BYTES, Limits
@@ -69,6 +69,10 @@ WORKER_TYPES = frozenset(
 FRAME_TYPES = REQUEST_TYPES | WORKER_TYPES | {CHUNK_TYPE}
 BODY_OWNERS = frozenset({"call", "checkpoint", "result"})
 REQUEST_ID_TYPES = frozenset({"ack", "reserve", "usage", "checkpoint"})
+# Operation ids and request ids are text of at most this many characters.
+_MAX_IDENTIFIER_CHARS = 256
+# Arrays and objects may nest this deep. The frame object itself is level 1.
+_MAX_NESTING_DEPTH = 64
 
 
 def max_frame_bytes(frame_type: str, limits: Limits = DEFAULT_LIMITS) -> int:
@@ -89,13 +93,20 @@ def decode_chunk_data(data: str, *, limits: Limits = DEFAULT_LIMITS) -> bytes:
     return raw
 
 
-def _require_str(frame: Mapping[str, Any], key: str) -> None:
-    if not isinstance(frame.get(key), str):
-        raise FrameError(f"{frame.get('t')} frame needs a string field {key!r}")
+def _is_identifier(value: object) -> bool:
+    """Return True for text of at most 256 characters that encodes as UTF-8."""
+    if not isinstance(value, str) or len(value) > _MAX_IDENTIFIER_CHARS:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _validate_chunk(frame: Mapping[str, Any], limits: Limits) -> None:
-    if frame.get("of") not in BODY_OWNERS:
+    of = frame.get("of")
+    if not isinstance(of, str) or of not in BODY_OWNERS:
         raise FrameError("chunk frame must name the frame it belongs to in 'of'")
     seq = frame.get("seq")
     if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
@@ -105,8 +116,8 @@ def _validate_chunk(frame: Mapping[str, Any], limits: Limits) -> None:
     data = frame.get("data")
     if not isinstance(data, str):
         raise FrameError("chunk frame needs string 'data'")
-    if "req" in frame and not isinstance(frame["req"], str):
-        raise FrameError("chunk frame field 'req' must be a string")
+    if "req" in frame and not _is_identifier(frame["req"]):
+        raise FrameError("chunk frame field 'req' must be text of at most 256 characters")
     decode_chunk_data(data, limits=limits)
 
 
@@ -114,19 +125,44 @@ def validate_frame(frame: Mapping[str, Any], *, limits: Limits = DEFAULT_LIMITS)
     """Check the structure of a decoded frame. Size limits are checked elsewhere."""
     frame_type = frame.get("t")
     if not isinstance(frame_type, str) or frame_type not in FRAME_TYPES:
-        raise FrameError(f"unknown frame type {frame_type!r}")
+        # The value is never repeated: it came from the peer and may be large.
+        raise FrameError("unknown frame type")
     op = frame.get("op")
-    if not isinstance(op, str):
-        raise FrameError(f"{frame_type} frame needs a string operation id 'op'")
-    if not op and frame_type not in CONNECTION_TYPES:
+    if not _is_identifier(op):
+        raise FrameError(
+            f"{frame_type} frame needs a string operation id 'op' of at most 256 characters"
+        )
+    if frame_type in CONNECTION_TYPES:
+        if op != "":
+            raise FrameError(f"{frame_type} frame must use the empty operation id")
+    elif not op:
         raise FrameError(f"{frame_type} frame needs a non-empty operation id")
-    if frame_type in REQUEST_ID_TYPES:
-        _require_str(frame, "req")
+    if frame_type in REQUEST_ID_TYPES and not _is_identifier(frame.get("req")):
+        raise FrameError(f"{frame_type} frame needs a string field 'req' of at most 256 characters")
     if frame_type == CHUNK_TYPE:
         _validate_chunk(frame, limits)
 
 
+def _check_nesting(frame: Mapping[str, Any]) -> None:
+    """Refuse a frame whose arrays or objects nest deeper than the limit.
+
+    The frame object is level 1. The walk keeps its own stack, so a deeply
+    nested value cannot exhaust the interpreter's recursion limit, and it stops
+    at the first container that is too deep.
+    """
+    pending: list[tuple[Any, int]] = [(frame, 1)]
+    while pending:
+        node, depth = pending.pop()
+        children: Iterable[Any] = node.values() if isinstance(node, Mapping) else node
+        for child in children:
+            if isinstance(child, (Mapping, list, tuple)):
+                if depth >= _MAX_NESTING_DEPTH:
+                    raise FrameError(f"frame nests deeper than {_MAX_NESTING_DEPTH} levels")
+                pending.append((child, depth + 1))
+
+
 def _dump(frame: Mapping[str, Any]) -> bytes:
+    _check_nesting(frame)
     try:
         text = json.dumps(dict(frame), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError, RecursionError) as exc:
@@ -159,7 +195,8 @@ def decode_payload(payload: bytes, *, limits: Limits = DEFAULT_LIMITS) -> dict[s
     """Decode the JSON payload of one frame and check its structure and size.
 
     A payload the decoder refuses, such as an integer with more digits than
-    Python converts or nesting too deep to parse, is a frame error.
+    Python converts, is a frame error. So is nesting deeper than 64 levels,
+    whether or not the decoder accepts it.
     """
     try:
         frame = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant)
@@ -167,6 +204,7 @@ def decode_payload(payload: bytes, *, limits: Limits = DEFAULT_LIMITS) -> dict[s
         raise FrameError(f"frame is not UTF-8 JSON that the decoder accepts: {exc}") from exc
     if not isinstance(frame, dict):
         raise FrameError("frame must be a JSON object")
+    _check_nesting(frame)
     validate_frame(frame, limits=limits)
     limit = max_frame_bytes(str(frame["t"]), limits)
     if len(payload) > limit:
