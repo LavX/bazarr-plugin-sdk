@@ -77,7 +77,9 @@ operations.
 - `method`: the operation name the host called.
 - `params`: the JSON object the host sent.
 - `secrets`: a mapping of credential names to text. Credentials appear only
-  here. The SDK never writes them to frames or to standard error.
+  here, and `repr(request)` leaves them out. The SDK does not write them to
+  frames or to standard error itself. Exception text is different: see
+  "Errors" below.
 - `body`: the request body as bytes, or None when the call sent none.
 
 ## The context
@@ -105,9 +107,11 @@ the cost is recorded.
 Send a heartbeat often enough to stay inside `heartbeat_interval` during long
 work. A long loop with no progress or heartbeat can be treated as stalled.
 
-When the host cancels an operation, the `cancelled` event is set and any
-awaited call in progress is interrupted. Check `ctx.cancelled.is_set()` between
-steps of long work.
+When the host cancels an operation, the `cancelled` event is set. An operation
+declared with `async def` has the awaited call in progress interrupted. An
+operation declared with plain `def` keeps running on its thread after the
+cancel, and the SDK never joins that thread. Check `ctx.cancelled.is_set()`
+between steps of long work in both kinds.
 
 `OperationAbandoned` is raised by context calls after the host has discarded
 the operation. Let it propagate. Retrying does not help.
@@ -136,7 +140,9 @@ is cut to 500 characters.
 
 Any other exception becomes an `internal` error. The host sees the exception
 class name and its text, cut to 500 characters. The traceback goes to standard
-error, not to the host.
+error, not to the host. The text is forwarded to the host, and the traceback
+contains the same text on standard error, so keep secrets out of exception
+messages.
 
 ## Bodies
 
@@ -155,7 +161,7 @@ chunks of up to 1 MiB and reassembles them on the host side.
 
 | Status | Meaning |
 | --- | --- |
-| 0 | Orderly shutdown, or the host closed the connection. |
+| 0 | Orderly shutdown, or the host closed the connection or standard input, before or after `hello`. |
 | 2 | The environment is wrong, for example a missing descriptor variable or no `kind_api`. |
 | 76 | Protocol error. |
 | 78 | The host asked for a kind this worker does not serve. |

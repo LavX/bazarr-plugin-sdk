@@ -3,8 +3,8 @@
 A plugin's entry point calls ``serve(MyPlugin)`` and exits with the status it
 returns. The host passes the two frame descriptors in ``BAZARR_PLUGIN_FD_IN``
 (frames from the host) and ``BAZARR_PLUGIN_FD_OUT`` (frames to the host).
-Standard output is redirected to standard error before any plugin code runs,
-so a stray ``print`` cannot corrupt a frame.
+Standard output is redirected to standard error from the moment ``serve()``
+starts, so a stray ``print`` made by plugin code cannot corrupt a frame.
 
 The worker exits when the host closes its frame stream or the standard input
 pipe, which the host keeps open for the life of the worker.

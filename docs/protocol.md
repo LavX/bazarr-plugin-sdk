@@ -19,14 +19,26 @@ with status 2 when either variable is missing or malformed.
 
 Standard input is a liveness pipe. The host keeps it open for the life of the
 worker. When standard input reaches end of file, the worker exits with status
-0. The worker never reads frames from standard input.
+0, whether or not `hello` has been received. The worker never reads frames from
+standard input. It discards any bytes that arrive there.
 
-Standard output is redirected to standard error before plugin code runs. A
-plugin's `print` output and log records go to standard error. Standard error
-is free text for people. The host must not parse it.
+Standard output is redirected to standard error from the moment `serve()`
+starts. A plugin's `print` output and log records go to standard error, so a
+worker writes nothing to standard output once `serve()` has started. Output
+written before `serve()` is called is not a frame either. The host must not
+parse standard output or standard error. Standard error is free text for
+people.
 
 The protocol is defined for POSIX descriptors. Passing descriptors on Windows
 is not verified in version 0.1.0.
+
+## Host obligations
+
+The host must always drain the worker's frame stream (`BAZARR_PLUGIN_FD_OUT`),
+even when it has nothing to ask. A host that stops reading blocks every write
+the worker makes, including the error frame that answers a cancel and the
+writes made during a shutdown. The worker cannot send anything until the host
+reads again.
 
 ## Framing
 
@@ -36,7 +48,9 @@ Every frame is:
 2. `N` bytes of UTF-8 encoded JSON. The JSON value is an object.
 
 A length of zero is an error. The JSON must not contain `NaN`, `Infinity` or
-`-Infinity`. Every frame object has:
+`-Infinity`. A payload that the JSON decoder refuses, such as an integer with
+more digits than Python converts or nesting too deep to parse, is a malformed
+frame. Every frame object has:
 
 - `t`: the frame type, a string.
 - `op`: the operation id, a non-empty string. Connection frames (`hello`,
@@ -57,10 +71,13 @@ A length of zero is an error. The JSON must not contain `NaN`, `Infinity` or
 The JSON payload of a `chunk` frame may be as large as the base64 text of
 `chunk_bytes` plus `control_frame_bytes`.
 
-The reader checks the length prefix against the largest payload any frame may
-have before it reads the payload. A frame that is too large is refused without
-reading its body. The reader then treats the stream as broken and the worker
-exits with status 76.
+The reader checks the length prefix against the channel limit before it reads
+the payload. The channel limit is `chunk_frame_bytes`, the largest payload any
+frame may have: 1,463,640 bytes with the default limits. A length above it is
+refused without reading the body. A control frame whose length lies between its
+own 64 KiB limit and the channel limit is read in full and then refused, so its
+body is read before the refusal. Either way the reader treats the stream as
+broken and the worker exits with status 76.
 
 The host sends the limits it uses in `hello`. A worker may be sent smaller
 limits than the defaults. Limits above the defaults make `hello` malformed and
@@ -111,11 +128,14 @@ The first frame on the channel. Any other first frame is a protocol error.
 }
 ```
 
-- `protocol` must be `1`.
+- `protocol` must be the integer `1`. A boolean is a malformed hello (status
+  76). Any other value that is not `1` is a version the worker does not serve
+  (status 78).
 - `kind_api` must equal the `kind_api` the worker class declares.
 - `heartbeat_interval` is a positive number of seconds. The worker stores it
   and exposes it to plugin code. The worker never sends heartbeats on its own.
-- `max_in_flight` is an integer of 1 or more.
+- `max_in_flight` is required. It is an integer of 1 or more. A hello without
+  it is malformed and the worker exits with status 76.
 - Each folder value is an absolute path. The folders are fixed for the life
   of the worker.
 
@@ -140,7 +160,7 @@ Sent after `hello` is accepted and the plugin object is created.
 
 | Status | Meaning |
 | --- | --- |
-| 0 | Orderly shutdown, end of the frame stream, or end of standard input. |
+| 0 | Orderly shutdown; end of the frame stream; end of standard input, before or after `hello`; the host pipe closed while the worker wrote a frame; or a read error on the frame descriptor. |
 | 2 | The environment is wrong: a descriptor variable is missing or invalid, the class sets no `kind_api`, or the plugin constructor raised. |
 | 76 | Protocol error: the first frame is not `hello`, `hello` is malformed, a frame is malformed or too large, a frame type is not allowed in this direction, or an operation id is started twice. |
 | 78 | The host asked for a protocol version or a kind this worker does not serve. |
@@ -174,7 +194,9 @@ non-zero status.
 ```
 
 - Sets the operation's `cancelled` flag. The plugin observes the flag through
-  its context, and an operation awaiting a host call is interrupted.
+  its context. An `async` operation that is awaiting a context call is
+  interrupted. A `def` operation keeps running on its thread after the cancel
+  and is never joined.
 - With `abandon` true the worker also sets the abandoned flag. The host must
   then ignore every later frame for that operation id. The worker stops the
   operation at its next context call and sends no further result frame for it.
@@ -307,6 +329,10 @@ If the error frame does not fit in one control frame, the worker sends an
 
 An exception that is not a plugin error becomes an `internal` error. Plugin code
 that wants the host to see a specific code raises the matching error.
+
+The exception text is forwarded to the host, and the traceback, which contains
+the same text, goes to standard error. Plugin code must keep secrets out of
+exception messages.
 
 ## Ordering
 
