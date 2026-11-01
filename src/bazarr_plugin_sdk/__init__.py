@@ -7,6 +7,22 @@ the framed protocol, and a conformance suite that runs against a scripted host.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+from ._version import __version__
+from .context import BlockingContext, Folders, PluginContext, Request, Result
+from .errors import HostGone, OperationAbandoned, PluginError
+from .plugin import Plugin
+from .runtime import serve
 
-__all__ = ["__version__"]
+__all__ = [
+    "BlockingContext",
+    "Folders",
+    "HostGone",
+    "OperationAbandoned",
+    "Plugin",
+    "PluginContext",
+    "PluginError",
+    "Request",
+    "Result",
+    "__version__",
+    "serve",
+]
