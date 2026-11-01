@@ -355,7 +355,7 @@ class FakeHost:
         self._send({"t": "shutdown", "op": ""})
 
     def send_raw(self, data: bytes) -> None:
-        """Write bytes to the worker unchecked. Use only to test how a worker refuses bad framing."""
+        """Write raw bytes to the worker. Use only to test how a worker refuses bad framing."""
         if self._in_fd is None:
             raise RuntimeError("the worker has not been started")
         with self._write_lock:

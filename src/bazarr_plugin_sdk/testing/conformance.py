@@ -297,7 +297,9 @@ class _Suite:
         if len(beats) < 2:
             return "fail", f"the worker sent {len(beats)} heartbeats, expected at least two"
         points = [outcome.started_at, *beats, outcome.finished_at]
-        longest_silence = max(later - earlier for earlier, later in zip(points, points[1:]))
+        longest_silence = max(
+            later - earlier for earlier, later in zip(points, points[1:], strict=True)
+        )
         limit = STALL_INTERVALS * CONFORMANCE_HEARTBEAT_INTERVAL
         if longest_silence >= limit:
             return "fail", f"{longest_silence:.2f} seconds without a heartbeat (limit {limit})"
