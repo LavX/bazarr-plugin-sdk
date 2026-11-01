@@ -163,6 +163,37 @@ def test_non_standard_json_constants_are_refused() -> None:
         decode_payload(b'{"t":"progress","op":"op-1","done":NaN}')
 
 
+def test_integer_beyond_the_decoder_digit_limit_is_a_frame_error() -> None:
+    payload = b'{"t":"progress","op":"op-1","done":' + b"1" * 5000 + b"}"
+    assert len(payload) < CONTROL_FRAME_BYTES
+    with pytest.raises(FrameError, match="UTF-8 JSON"):
+        decode_payload(payload)
+
+
+def test_nesting_too_deep_to_decode_is_a_frame_error() -> None:
+    depth = 30_000
+    payload = b'{"t":"progress","op":"op-1","message":' + b"[" * depth + b"]" * depth + b"}"
+    assert len(payload) < CONTROL_FRAME_BYTES
+    with pytest.raises(FrameError, match="UTF-8 JSON"):
+        decode_payload(payload)
+
+
+def test_value_nested_too_deep_to_encode_is_a_frame_error() -> None:
+    value: object = "x"
+    for _ in range(5000):
+        value = [value]
+    with pytest.raises(FrameError, match="not JSON"):
+        encode_frame({"t": "result", "op": "op-1", "value": {"x": value}, "body": False})
+
+
+def test_log_and_host_call_are_reserved_and_not_frame_types() -> None:
+    for frame_type in ("log", "host_call"):
+        with pytest.raises(FrameError, match="unknown frame type"):
+            validate_frame({"t": frame_type, "op": "op-1"})
+    with pytest.raises(FrameError, match="unknown frame type"):
+        decode_payload(b'{"t":"log","op":"op-1"}')
+
+
 def test_max_frame_bytes_depends_on_frame_type() -> None:
     assert max_frame_bytes("chunk") == DEFAULT_LIMITS.chunk_frame_bytes
     assert max_frame_bytes("call") == CONTROL_FRAME_BYTES

@@ -52,6 +52,8 @@ class FrameTooLarge(FrameError):
 CHUNK_TYPE = "chunk"
 CONNECTION_TYPES = frozenset({"hello", "hello_ack", "shutdown"})
 REQUEST_TYPES = frozenset({"hello", "call", "cancel", "ack", "shutdown"})
+# Frames the worker may send. ``log`` and ``host_call`` are reserved names that
+# neither side sends in version 1, so they are not frame types at all.
 WORKER_TYPES = frozenset(
     {
         "hello_ack",
@@ -62,8 +64,6 @@ WORKER_TYPES = frozenset(
         "checkpoint",
         "result",
         "error",
-        "log",
-        "host_call",
     }
 )
 FRAME_TYPES = REQUEST_TYPES | WORKER_TYPES | {CHUNK_TYPE}
@@ -129,7 +129,7 @@ def validate_frame(frame: Mapping[str, Any], *, limits: Limits = DEFAULT_LIMITS)
 def _dump(frame: Mapping[str, Any]) -> bytes:
     try:
         text = json.dumps(dict(frame), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise FrameError(f"frame is not JSON serialisable: {exc}") from exc
     try:
         return text.encode("utf-8")
@@ -156,11 +156,15 @@ def _reject_constant(name: str) -> None:
 
 
 def decode_payload(payload: bytes, *, limits: Limits = DEFAULT_LIMITS) -> dict[str, Any]:
-    """Decode the JSON payload of one frame and check its structure and size."""
+    """Decode the JSON payload of one frame and check its structure and size.
+
+    A payload the decoder refuses, such as an integer with more digits than
+    Python converts or nesting too deep to parse, is a frame error.
+    """
     try:
         frame = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise FrameError(f"frame is not UTF-8 JSON: {exc}") from exc
+    except (ValueError, RecursionError) as exc:
+        raise FrameError(f"frame is not UTF-8 JSON that the decoder accepts: {exc}") from exc
     if not isinstance(frame, dict):
         raise FrameError("frame must be a JSON object")
     validate_frame(frame, limits=limits)

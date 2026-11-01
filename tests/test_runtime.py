@@ -2,15 +2,117 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from sample_plugin import MIB, SamplePlugin
 
+from bazarr_plugin_sdk.runtime import ENV_FD_IN, ENV_FD_OUT
 from bazarr_plugin_sdk.testing import CallOutcome, FakeHost
-from bazarr_plugin_sdk.testing.fake_host import plugin_spec
+from bazarr_plugin_sdk.testing.fake_host import WORKER_MODULE, plugin_spec
+from bazarr_plugin_sdk.wire import DEFAULT_LIMITS, PROTOCOL_VERSION, encode_frame
+
+# Payloads that the JSON decoder refuses although they fit in one control frame.
+UNDECODABLE_PAYLOADS = {
+    "integer-over-digit-limit": b'{"t":"progress","op":"op-1","done":' + b"1" * 5000 + b"}",
+    "nesting-too-deep": b'{"t":"progress","op":"op-1","message":'
+    + b"[" * 30_000
+    + b"]" * 30_000
+    + b"}",
+}
+
+
+def framed(payload: bytes) -> bytes:
+    return len(payload).to_bytes(4, "big") + payload
+
+
+def hello_frame(root: Path, *, remove: tuple[str, ...] = (), **changes: object) -> bytes:
+    fields: dict[str, object] = {
+        "t": "hello",
+        "op": "",
+        "protocol": PROTOCOL_VERSION,
+        "kind_api": "sample.v1",
+        "host_version": "test",
+        "limits": DEFAULT_LIMITS.to_dict(),
+        "heartbeat_interval": 1.0,
+        "max_in_flight": 1,
+        "folders": {
+            "data_dir": str(root / "data"),
+            "temp_dir": str(root / "tmp"),
+            "artifacts_dir": str(root / "artifacts"),
+        },
+    }
+    for name in remove:
+        del fields[name]
+    fields.update(changes)
+    return encode_frame(fields)
+
+
+@dataclass
+class RawWorker:
+    """A worker process whose frames the test writes by hand."""
+
+    process: subprocess.Popen[bytes]
+    frames_in: int
+    stdin: int
+
+    def send(self, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(self.frames_in, view) :]
+
+    def close_stdin(self) -> None:
+        if self.stdin >= 0:
+            os.close(self.stdin)
+            self.stdin = -1
+
+    def wait(self, timeout: float = 10.0) -> int:
+        return self.process.wait(timeout=timeout)
+
+
+@contextmanager
+def raw_worker(root: Path) -> Iterator[RawWorker]:
+    in_read, in_write = os.pipe()
+    out_read, out_write = os.pipe()
+    stdin_read, stdin_write = os.pipe()
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": os.pathsep.join(entry for entry in sys.path if entry),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "LANG": "C.UTF-8",
+        ENV_FD_IN: str(in_read),
+        ENV_FD_OUT: str(out_write),
+    }
+    with (root / "worker-stderr.txt").open("wb") as stderr:
+        process = subprocess.Popen(
+            [sys.executable, "-B", "-m", WORKER_MODULE, "sample_plugin:SamplePlugin"],
+            stdin=stdin_read,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+            pass_fds=(in_read, out_write),
+            env=env,
+            cwd=str(root),
+        )
+    os.close(in_read)
+    os.close(out_write)
+    os.close(stdin_read)
+    worker = RawWorker(process, in_write, stdin_write)
+    try:
+        yield worker
+    finally:
+        worker.close_stdin()
+        os.close(in_write)
+        os.close(out_read)
+        if process.poll() is None:
+            process.kill()
+        process.wait()
 
 
 @pytest.fixture
@@ -224,6 +326,20 @@ def test_handshake_for_a_kind_the_worker_does_not_serve_exits_78(tmp_path: Path)
 def test_oversize_frame_from_the_host_exits_76(host: FakeHost) -> None:
     host.start()
     host.send_raw((2_000_000).to_bytes(4, "big"))
+    assert host.close() == 76
+
+
+@pytest.mark.parametrize("payload", UNDECODABLE_PAYLOADS.values(), ids=UNDECODABLE_PAYLOADS)
+def test_handshake_frame_the_decoder_refuses_exits_76(tmp_path: Path, payload: bytes) -> None:
+    with raw_worker(tmp_path) as worker:
+        worker.send(framed(payload))
+        assert worker.wait() == 76
+
+
+@pytest.mark.parametrize("payload", UNDECODABLE_PAYLOADS.values(), ids=UNDECODABLE_PAYLOADS)
+def test_steady_state_frame_the_decoder_refuses_exits_76(host: FakeHost, payload: bytes) -> None:
+    host.start()
+    host.send_raw(framed(payload))
     assert host.close() == 76
 
 
