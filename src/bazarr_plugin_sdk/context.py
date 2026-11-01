@@ -53,11 +53,14 @@ class Request:
     ``params`` is the JSON object the host sent. ``secrets`` holds the stored
     credentials for this call and is the only place they appear. ``body`` is
     the request body in bytes, or None when the call sent none.
+
+    ``secrets`` is left out of ``repr`` so that logging a request does not
+    print credentials.
     """
 
     method: str
     params: Mapping[str, Any]
-    secrets: Mapping[str, str]
+    secrets: Mapping[str, str] = field(repr=False)
     body: bytes | None = None
 
 

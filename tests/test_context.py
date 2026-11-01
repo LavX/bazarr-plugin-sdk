@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -265,6 +266,17 @@ def test_request_and_result_have_sensible_defaults() -> None:
     result = Result()
     assert result.value is None
     assert result.body is None
+
+
+def test_request_repr_hides_the_secret_names_and_values() -> None:
+    name = "conformance_api_key"
+    value = "secret-" + secrets.token_hex(16)
+    request = Request(method="search", params={"q": "x"}, secrets={name: value})
+    text = repr(request)
+    assert "search" in text
+    assert name not in text
+    assert value not in text
+    assert request.secrets == {name: value}
 
 
 def test_blocking_context_runs_awaited_calls_on_the_loop_thread() -> None:
