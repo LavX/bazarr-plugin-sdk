@@ -54,14 +54,14 @@ class Request:
     credentials for this call and is the only place they appear. ``body`` is
     the request body in bytes, or None when the call sent none.
 
-    ``secrets`` is left out of ``repr`` so that logging a request does not
-    print credentials.
+    ``secrets`` and ``body`` are left out of ``repr`` so that logging a request
+    does not print credentials or the body.
     """
 
     method: str
     params: Mapping[str, Any]
     secrets: Mapping[str, str] = field(repr=False)
-    body: bytes | None = None
+    body: bytes | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -78,10 +78,18 @@ class Result:
 
 @dataclass
 class OperationState:
-    """Cancellation flags shared between the reader and one operation."""
+    """Cancellation flags and the final-frame state shared by one operation.
+
+    ``finished`` is set when the worker has sent the operation's result or
+    error frame. From then on the context refuses every frame for the
+    operation. ``send_lock`` makes the check and the write of a synchronous
+    frame one step, so a frame cannot be written after the final frame.
+    """
 
     cancelled: threading.Event = field(default_factory=threading.Event)
     abandoned: threading.Event = field(default_factory=threading.Event)
+    finished: threading.Event = field(default_factory=threading.Event)
+    send_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class Channel(Protocol):
@@ -107,7 +115,7 @@ def raise_for_ack(ack: Mapping[str, Any]) -> None:
     else:
         code = INTERNAL
         message = "the host refused the request"
-    if code not in CODES:
+    if not isinstance(code, str) or code not in CODES:
         code = INTERNAL
     raise PluginError(str(code), message)
 
@@ -152,6 +160,10 @@ class PluginContext:
     ceiling). Its keys belong to the kind. ``cancelled`` is set when the host
     cancels the operation. ``heartbeat_interval`` is the number of seconds the
     host allows between heartbeats. ``log`` writes to the worker's stderr.
+
+    Once the operation has sent its result or error, every context call raises
+    ``OperationAbandoned``. A plain ``def`` operation that ignores cancellation
+    keeps running on its thread until it returns, and then sees that error.
     """
 
     def __init__(
@@ -179,8 +191,18 @@ class PluginContext:
         self.log: logging.Logger = log or logging.getLogger(LOGGER_NAME)
 
     def _ensure_open(self) -> None:
+        # Awaited frames check this and write in the same step of the event loop,
+        # the thread that writes final frames, so no final frame can come between.
         if self._state.abandoned.is_set():
             raise OperationAbandoned("the host abandoned this operation")
+        if self._state.finished.is_set():
+            raise OperationAbandoned("the operation has already sent its final frame")
+
+    def _send_now(self, frame: Mapping[str, Any]) -> None:
+        """Write a synchronous frame unless the operation has already finished."""
+        with self._state.send_lock:
+            self._ensure_open()
+            self._channel.send(frame)
 
     def progress(self, done: int, total: int | None = None, message: str = "") -> None:
         """Report progress. Returns at once without waiting for the host."""
@@ -192,16 +214,16 @@ class PluginContext:
             "total": None if total is None else _count(total, "total"),
             "message": _text(message, "message"),
         }
-        self._channel.send(frame)
+        self._send_now(frame)
 
     def heartbeat(self) -> None:
         """Tell the host the operation is alive. Returns at once without waiting.
 
         Raises ``HostGone`` when the host connection has closed, and
-        ``OperationAbandoned`` when the host has abandoned the operation.
+        ``OperationAbandoned`` when the host has abandoned the operation or the
+        operation has already sent its final frame.
         """
-        self._ensure_open()
-        self._channel.send({"t": "heartbeat", "op": self._operation_id})
+        self._send_now({"t": "heartbeat", "op": self._operation_id})
 
     async def reserve(self, amount: float, model: str) -> str | None:
         """Reserve ``amount`` of spend for ``model`` and return the reservation id.

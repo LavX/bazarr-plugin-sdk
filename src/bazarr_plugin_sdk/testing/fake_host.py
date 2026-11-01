@@ -260,6 +260,21 @@ class FakeHost:
         self.exit_code = code
         return code
 
+    def wait_for_exit(self, timeout: float = 5.0) -> int:
+        """Wait for the worker to exit on its own, leaving its inputs open. Returns the status.
+
+        Raises ``TimeoutError`` when the worker is still running after ``timeout``
+        seconds. The worker is then killed, so a test never hangs on it.
+        """
+        if self._process is None:
+            raise RuntimeError("the worker has not been started")
+        try:
+            return self._process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            self._process.kill()
+            self._process.wait()
+            raise TimeoutError(f"the worker did not exit within {timeout} seconds") from exc
+
     @staticmethod
     def _drain(stream: Any, sink: list[bytes]) -> None:
         if stream is None:

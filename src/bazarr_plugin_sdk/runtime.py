@@ -15,8 +15,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import os
 import select
+import stat
 import sys
 import threading
 import traceback
@@ -52,6 +54,7 @@ from .wire import (
     BodyAssembler,
     FrameError,
     FrameReader,
+    FrameTooLarge,
     Limits,
     encode_frame,
     iter_body_frames,
@@ -70,6 +73,7 @@ __all__ = [
 ENV_FD_IN = "BAZARR_PLUGIN_FD_IN"
 ENV_FD_OUT = "BAZARR_PLUGIN_FD_OUT"
 _STDIN_FD = 0
+_MAX_DESCRIPTOR = 2**31 - 1
 
 EXIT_OK = 0
 EXIT_ENVIRONMENT = 2
@@ -77,6 +81,18 @@ EXIT_PROTOCOL = 76
 EXIT_CONTRACT_NOT_SERVED = 78
 
 RESULT_LIMIT_MESSAGE = "the result body exceeds the result limit"
+
+# Seconds the worker gives its operations to end once shutdown begins. The
+# watchdog ends the process at this bound, whatever is still running.
+_TEARDOWN_SECONDS = 2.0
+# Seconds the stdin watcher waits for the reader thread before it reports end
+# of input, so that a protocol error the reader holds is not overtaken.
+_READER_JOIN_SECONDS = 2.0
+# Characters of host text that an error message may repeat.
+_ECHO_LIMIT = 64
+
+_READABLE = select.POLLIN | select.POLLHUP
+_BROKEN = select.POLLNVAL | select.POLLERR
 
 _TEMP_VARIABLES = ("TMPDIR", "TMP", "TEMP")
 
@@ -89,6 +105,10 @@ def _report(text: str) -> None:
         pass
 
 
+class _DescriptorError(Exception):
+    """A read failed on the frame or standard input descriptor. The worker exits with status 2."""
+
+
 def _descriptor(name: str) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -99,6 +119,14 @@ def _descriptor(name: str) -> int:
         raise ValueError(f"{name} is not a descriptor number") from exc
     if fd < 3:
         raise ValueError(f"{name} must be a descriptor above 2")
+    if fd > _MAX_DESCRIPTOR:
+        raise ValueError(f"{name} must be at most {_MAX_DESCRIPTOR}")
+    try:
+        status = os.fstat(fd)
+    except OSError as exc:
+        raise ValueError(f"{name} is not an open descriptor: {exc}") from exc
+    if stat.S_ISDIR(status.st_mode):
+        raise ValueError(f"{name} is a directory, not a pipe")
     return fd
 
 
@@ -124,6 +152,24 @@ def _folders_json(folders: Folders) -> dict[str, str]:
 
 def _environment_report() -> dict[str, str]:
     return {name: os.environ[name] for name in _TEMP_VARIABLES if name in os.environ}
+
+
+def _heartbeat_seconds(raw: object) -> float:
+    """Return the heartbeat interval as seconds: a finite number greater than zero."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("heartbeat_interval must be a positive number")
+    try:
+        seconds = float(raw)
+    except OverflowError as exc:
+        raise ValueError("heartbeat_interval must be a finite number of seconds") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("heartbeat_interval must be a finite number of seconds above zero")
+    return seconds
+
+
+def _unknown_operation(method: str) -> PluginError:
+    # The host's text is cut before it is repeated in an error frame.
+    return PluginError(INTERNAL, f"unknown operation {method[:_ECHO_LIMIT]!r}")
 
 
 def _post(loop: asyncio.AbstractEventLoop, function: Callable[..., Any], *args: Any) -> None:
@@ -209,6 +255,8 @@ class _Worker:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop: asyncio.Event | None = None
         self._reader: FrameReader | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._teardown_done = threading.Event()
 
     # ----- start-up -------------------------------------------------------
 
@@ -218,7 +266,10 @@ class _Worker:
         if status is not None:
             return status
         self._reader = FrameReader(self._read_input, limits=self._limits)
-        return asyncio.run(self._serve())
+        try:
+            return asyncio.run(self._serve())
+        finally:
+            self._teardown_done.set()
 
     def _read_input(self, count: int) -> bytes:
         return os.read(self._fd_in, count)
@@ -227,17 +278,36 @@ class _Worker:
         """Read the handshake from the frame descriptor while watching standard input.
 
         End of standard input before hello ends the worker, as it does after
-        hello. Bytes that arrive on standard input are discarded.
+        hello. Bytes that arrive on standard input are discarded. A failed read
+        on either descriptor raises ``_DescriptorError``.
         """
+        poller = select.poll()
+        poller.register(self._fd_in, _READABLE)
+        poller.register(_STDIN_FD, _READABLE)
         while True:
             try:
-                ready, _, _ = select.select([self._fd_in, _STDIN_FD], [], [])
-                if self._fd_in in ready:
-                    return os.read(self._fd_in, count)
-                if not os.read(_STDIN_FD, 1):
-                    raise HostGone("standard input closed before hello")
+                ready = poller.poll()
             except OSError as exc:
-                raise HostGone(f"standard input failed before hello: {exc}") from exc
+                raise _DescriptorError(f"waiting for the descriptors failed: {exc}") from exc
+            events = dict(ready)
+            frame_events = events.get(self._fd_in, 0)
+            if frame_events & _BROKEN:
+                raise _DescriptorError("the frame descriptor cannot be read")
+            if frame_events & _READABLE:
+                try:
+                    return os.read(self._fd_in, count)
+                except OSError as exc:
+                    raise _DescriptorError(f"reading the frame descriptor failed: {exc}") from exc
+            stdin_events = events.get(_STDIN_FD, 0)
+            if stdin_events & _BROKEN:
+                raise _DescriptorError("standard input cannot be read")
+            if stdin_events & _READABLE:
+                try:
+                    discarded = os.read(_STDIN_FD, 1)
+                except OSError as exc:
+                    raise _DescriptorError(f"reading standard input failed: {exc}") from exc
+                if not discarded:
+                    raise HostGone("standard input closed before hello")
 
     def _handshake(self, reader: FrameReader) -> int | None:
         try:
@@ -248,15 +318,20 @@ class _Worker:
         except HostGone as exc:
             _report(f"plugin worker: {exc}")
             return EXIT_OK
-        if hello is None or hello.get("t") != "hello":
+        except _DescriptorError as exc:
+            _report(f"plugin worker: {exc}")
+            return EXIT_ENVIRONMENT
+        if hello is None:
+            return EXIT_OK  # the frame stream ended before hello
+        if hello.get("t") != "hello":
             _report("plugin worker: the first frame must be hello")
             return EXIT_PROTOCOL
         protocol = hello.get("protocol")
-        if isinstance(protocol, bool):
+        if isinstance(protocol, bool) or not isinstance(protocol, int):
             _report("plugin worker: malformed hello: protocol must be an integer")
             return EXIT_PROTOCOL
         if protocol != PROTOCOL_VERSION:
-            _report(f"plugin worker: host protocol {protocol!r} is not served")
+            _report(f"plugin worker: host protocol {protocol} is not served")
             return EXIT_CONTRACT_NOT_SERVED
         kind_api = self._plugin_class.kind_api
         if hello.get("kind_api") != kind_api:
@@ -269,11 +344,7 @@ class _Worker:
             limits = Limits.from_dict(hello.get("limits"))
             if not limits.within(DEFAULT_LIMITS):
                 raise ValueError("host limits exceed the limits this SDK supports")
-            interval = hello.get("heartbeat_interval")
-            if isinstance(interval, bool) or not isinstance(interval, (int, float)):
-                raise ValueError("heartbeat_interval must be a positive number")
-            if interval <= 0:
-                raise ValueError("heartbeat_interval must be a positive number")
+            interval = _heartbeat_seconds(hello.get("heartbeat_interval"))
             max_in_flight = hello.get("max_in_flight")
             if isinstance(max_in_flight, bool) or not isinstance(max_in_flight, int):
                 raise ValueError("max_in_flight must be a positive integer")
@@ -286,7 +357,7 @@ class _Worker:
 
         self._limits = limits
         self._folders = folders
-        self._heartbeat_interval = float(interval)
+        self._heartbeat_interval = interval
         self._max_in_flight = max_in_flight
         try:
             self._plugin = self._plugin_class()
@@ -306,7 +377,10 @@ class _Worker:
         }
         try:
             self._writer.write(encode_frame(ack, limits=limits))
-        except (HostGone, FrameError) as exc:
+        except HostGone as exc:
+            _report(f"plugin worker: could not send hello_ack: {exc}")
+            return EXIT_OK
+        except FrameError as exc:
             _report(f"plugin worker: could not send hello_ack: {exc}")
             return EXIT_PROTOCOL
         return None
@@ -314,15 +388,33 @@ class _Worker:
     async def _serve(self) -> int:
         self._loop = asyncio.get_running_loop()
         self._stop = asyncio.Event()
-        threading.Thread(target=self._read_frames, name="bazarr-plugin-reader", daemon=True).start()
+        reader = threading.Thread(
+            target=self._read_frames, name="bazarr-plugin-reader", daemon=True
+        )
+        self._reader_thread = reader
+        reader.start()
         threading.Thread(target=self._watch_input, name="bazarr-plugin-stdin", daemon=True).start()
         await self._stop.wait()
+        threading.Thread(
+            target=self._bound_teardown, name="bazarr-plugin-watchdog", daemon=True
+        ).start()
         tasks = [active.task for active in self._active.values() if active.task is not None]
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.wait(tasks, timeout=2.0)
+            await asyncio.wait(tasks, timeout=_TEARDOWN_SECONDS)
         return self._exit_code
+
+    def _bound_teardown(self) -> None:
+        """End the process when teardown outlasts its bound, even if tasks ignore cancellation."""
+        if self._teardown_done.wait(_TEARDOWN_SECONDS):
+            return
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        os._exit(self._exit_code)
 
     # ----- reader thread --------------------------------------------------
 
@@ -378,19 +470,30 @@ class _Worker:
             _report(f"plugin worker: protocol error: {exc}")
             _post(loop, self._finish, EXIT_PROTOCOL)
         except OSError as exc:
-            _report(f"plugin worker: the host pipe failed: {exc}")
-            _post(loop, self._finish, EXIT_OK)
+            _report(f"plugin worker: the host frame pipe failed: {exc}")
+            _post(loop, self._finish, EXIT_ENVIRONMENT)
+        except Exception as exc:
+            # Any other failure must still end the worker, or it would wait forever.
+            _report(f"plugin worker: the frame reader failed: {type(exc).__name__}")
+            _post(loop, self._finish, EXIT_PROTOCOL)
 
     def _watch_input(self) -> None:
         loop = self._loop
         if loop is None:  # pragma: no cover - set before the thread starts
             return
         try:
-            while os.read(0, 1):
+            while os.read(_STDIN_FD, 1):
                 pass
-        except OSError:
-            pass
-        _post(loop, self._finish, EXIT_OK)
+            code = EXIT_OK
+        except OSError as exc:
+            _report(f"plugin worker: standard input failed: {exc}")
+            code = EXIT_ENVIRONMENT
+        # The reader may hold a protocol error it has not posted yet. Waiting for
+        # it keeps that error ahead of the clean exit.
+        reader = self._reader_thread
+        if reader is not None:
+            reader.join(timeout=_READER_JOIN_SECONDS)
+        _post(loop, self._finish, code)
 
     # ----- loop-thread dispatch -------------------------------------------
 
@@ -434,7 +537,9 @@ class _Worker:
             self._finish(EXIT_PROTOCOL)
             return
         if len(self._active) >= self._max_in_flight:
-            self._send_error(op, PluginError(INTERNAL, "too many operations in flight"))
+            self._send_error(
+                OperationState(), op, PluginError(INTERNAL, "too many operations in flight")
+            )
             return
         try:
             request, budget = self._build_request(frame, body)
@@ -490,10 +595,10 @@ class _Worker:
 
     def _resolve(self, method: str) -> Callable[..., Any]:
         if self._plugin is None or method not in self._plugin_class.operations:
-            raise PluginError(INTERNAL, f"unknown operation {method!r}")
+            raise _unknown_operation(method)
         function = getattr(self._plugin, method, None)
         if not callable(function):
-            raise PluginError(INTERNAL, f"unknown operation {method!r}")
+            raise _unknown_operation(method)
         return function
 
     async def _run_operation(
@@ -515,22 +620,36 @@ class _Worker:
                 value = await self._run_in_thread(function, blocking, request)
             if active.state.cancelled.is_set():
                 raise PluginError(CANCELLED, "operation cancelled")
-            self._send_result(op, value, request)
+            try:
+                self._send_result(active.state, op, value, request)
+            except FrameTooLarge as exc:
+                raise PluginError(INTERNAL, "the result is too large to send") from exc
+            except FrameError as exc:
+                # The result cannot be encoded, so the stream ends here.
+                _report(f"plugin worker: the result cannot be encoded: {exc}")
+                self._finish(EXIT_PROTOCOL)
         except asyncio.CancelledError:
-            self._send_error(op, PluginError(CANCELLED, "operation cancelled"))
+            self._send_error(active.state, op, PluginError(CANCELLED, "operation cancelled"))
         except OperationAbandoned:
             pass
         except HostGone as exc:
             _report(f"plugin worker: {exc}")
             self._finish(EXIT_OK)
         except PluginError as exc:
-            self._send_error(op, exc)
+            self._send_error(active.state, op, exc)
         except Exception as exc:
             traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
             sys.stderr.flush()
-            self._send_error(op, internal_error(exc))
+            self._send_error(active.state, op, internal_error(exc))
         finally:
-            self._active.pop(op, None)
+            # The final frame has been sent by now in every path that sends one, and
+            # nothing yields between the two, so the slot is free for a reused id.
+            self._release(op, active)
+
+    def _release(self, op: str, active: _Active) -> None:
+        """Free the operation's slot, unless a later call has taken the same id."""
+        if self._active.get(op) is active:
+            del self._active[op]
 
     async def _run_in_thread(
         self,
@@ -605,12 +724,50 @@ class _Worker:
         self._pending[req] = future
         try:
             self.write_frame(message, body)
-        except BaseException:
+            return await future
+        finally:
             self._pending.pop(req, None)
-            raise
-        return await future
 
-    def _send_result(self, op: str, value: object, request: Request) -> None:
+    def _send_terminal(
+        self,
+        state: OperationState,
+        frame: dict[str, Any],
+        body: bytes | None = None,
+    ) -> None:
+        """Send the final frame of an operation, at most once.
+
+        FrameError is raised before any byte is written when the frame cannot be
+        encoded, so the caller may send a different final frame instead. A body
+        chunk that cannot be encoded after the frame is written leaves the
+        stream unusable, so the worker ends with a protocol error.
+        """
+        with state.send_lock:
+            if state.finished.is_set():
+                return
+            data = encode_frame(frame, limits=self._limits)
+            with self._writer.batch():
+                self._writer.write(data)
+                if body is not None:
+                    try:
+                        for chunk in iter_body_frames(
+                            of=str(frame["t"]),
+                            op=str(frame["op"]),
+                            data=body,
+                            limits=self._limits,
+                        ):
+                            self._writer.write(encode_frame(chunk, limits=self._limits))
+                    except FrameError as exc:
+                        _report(f"plugin worker: a body chunk cannot be encoded: {exc}")
+                        self._finish(EXIT_PROTOCOL)
+            state.finished.set()
+
+    def _send_result(
+        self,
+        state: OperationState,
+        op: str,
+        value: object,
+        request: Request,
+    ) -> None:
         result = _coerce_result(value)
         body = result.body
         if body is not None and len(body) > self._limits.result_limit(len(request.body or b"")):
@@ -621,9 +778,9 @@ class _Worker:
             "value": None if result.value is None else dict(result.value),
             "body": body is not None,
         }
-        self.write_frame(frame, body)
+        self._send_terminal(state, frame, body)
 
-    def _send_error(self, op: str, error: PluginError) -> None:
+    def _send_error(self, state: OperationState, op: str, error: PluginError) -> None:
         frame: dict[str, Any] = {
             "t": "error",
             "op": op,
@@ -633,18 +790,21 @@ class _Worker:
         }
         try:
             try:
-                data = encode_frame(frame, limits=self._limits)
+                self._send_terminal(state, frame)
             except FrameError:
-                data = encode_frame(
+                self._send_terminal(
+                    state,
                     {
                         "t": "error",
                         "op": op,
                         "code": INTERNAL,
                         "message": "the error details are too large to send",
                     },
-                    limits=self._limits,
                 )
-            self._writer.write(data)
+        except FrameError:
+            # Even the fallback cannot be encoded, so no final frame can be sent.
+            _report("plugin worker: the error response cannot be encoded")
+            self._finish(EXIT_PROTOCOL)
         except HostGone:
             self._finish(EXIT_OK)
 
@@ -668,9 +828,19 @@ def serve(plugin_class: type[Plugin]) -> int:
         if __name__ == "__main__":
             raise SystemExit(serve(MyPlugin))
 
-    The status is 0 after an orderly shutdown or when the host closes its
-    streams, 2 when the environment is wrong, 76 on a protocol error, and 78
-    when the host asks for a kind this worker does not serve.
+    The status is:
+
+    - 0 for end of input: an orderly shutdown, the end of the frame stream, the
+      end of standard input (before or after hello), or a closed host pipe while
+      the worker writes.
+    - 2 when the environment is wrong (a descriptor variable is missing,
+      malformed, not open or a directory, or the class sets no ``kind_api``), or
+      when a read fails on the frame or standard input descriptor.
+    - 76 on a protocol error.
+    - 78 when the host asks for a protocol or a kind this worker does not serve.
+
+    After shutdown begins the worker has two seconds to finish. When it does
+    not, the process ends with the status recorded so far.
     """
     kind_api = getattr(plugin_class, "kind_api", "")
     if not isinstance(kind_api, str) or not kind_api:
@@ -682,8 +852,11 @@ def serve(plugin_class: type[Plugin]) -> int:
     except ValueError as exc:
         _report(f"plugin worker: {exc}")
         return EXIT_ENVIRONMENT
-
-    os.dup2(2, 1)
+    try:
+        os.dup2(2, 1)
+    except OSError as exc:
+        _report(f"plugin worker: could not redirect standard output: {exc}")
+        return EXIT_ENVIRONMENT
     sys.stdout = sys.stderr
     _configure_logging()
     return _Worker(plugin_class, fd_in, fd_out).run()

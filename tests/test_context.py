@@ -260,6 +260,13 @@ def test_raise_for_ack_without_detail_is_internal() -> None:
     assert info.value.code == INTERNAL
 
 
+def test_raise_for_ack_with_a_malformed_code_is_internal() -> None:
+    for code in (["cancelled"], {"code": "cancelled"}, None, 5):
+        with pytest.raises(PluginError) as info:
+            raise_for_ack({"ok": False, "error": {"code": code, "message": "x"}})
+        assert info.value.code == INTERNAL
+
+
 def test_request_and_result_have_sensible_defaults() -> None:
     request = Request(method="echo", params={}, secrets={})
     assert request.body is None
@@ -277,6 +284,31 @@ def test_request_repr_hides_the_secret_names_and_values() -> None:
     assert name not in text
     assert value not in text
     assert request.secrets == {name: value}
+
+
+def test_request_repr_leaves_out_the_body() -> None:
+    request = Request(method="echo", params={}, secrets={}, body=b"payload-bytes")
+    assert "payload" not in repr(request)
+    assert request.body == b"payload-bytes"
+
+
+def test_context_calls_are_refused_once_the_final_frame_is_sent() -> None:
+    channel = FakeChannel()
+    state = OperationState()
+    context = make_context(channel, state=state)
+    state.finished.set()
+    with pytest.raises(OperationAbandoned):
+        context.progress(1, 2)
+    with pytest.raises(OperationAbandoned):
+        context.heartbeat()
+    with pytest.raises(OperationAbandoned):
+        run(context.reserve(0.1, "model-a"))
+    with pytest.raises(OperationAbandoned):
+        run(context.usage(1, 0.0, "model-a"))
+    with pytest.raises(OperationAbandoned):
+        run(context.checkpoint(b"data"))
+    assert channel.sent == []
+    assert channel.requests == []
 
 
 def test_blocking_context_runs_awaited_calls_on_the_loop_thread() -> None:

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
+import json
 import os
+import resource
+import select
 import subprocess
 import sys
 import threading
@@ -17,7 +21,12 @@ from sample_plugin import MIB, SamplePlugin
 from bazarr_plugin_sdk.runtime import ENV_FD_IN, ENV_FD_OUT
 from bazarr_plugin_sdk.testing import CallOutcome, FakeHost
 from bazarr_plugin_sdk.testing.fake_host import WORKER_MODULE, plugin_spec
-from bazarr_plugin_sdk.wire import DEFAULT_LIMITS, PROTOCOL_VERSION, encode_frame
+from bazarr_plugin_sdk.wire import (
+    DEFAULT_LIMITS,
+    PROTOCOL_VERSION,
+    FrameReader,
+    encode_frame,
+)
 
 # Payloads that the JSON decoder refuses although they fit in one control frame.
 UNDECODABLE_PAYLOADS = {
@@ -28,12 +37,17 @@ UNDECODABLE_PAYLOADS = {
     + b"}",
 }
 
+# Seconds a test waits for a worker process. A worker that does not exit in time fails the test.
+PROCESS_TIMEOUT = 10.0
+
 
 def framed(payload: bytes) -> bytes:
     return len(payload).to_bytes(4, "big") + payload
 
 
-def hello_frame(root: Path, *, remove: tuple[str, ...] = (), **changes: object) -> bytes:
+def hello_fields(
+    root: Path, *, remove: tuple[str, ...] = (), **changes: object
+) -> dict[str, object]:
     fields: dict[str, object] = {
         "t": "hello",
         "op": "",
@@ -52,7 +66,59 @@ def hello_frame(root: Path, *, remove: tuple[str, ...] = (), **changes: object) 
     for name in remove:
         del fields[name]
     fields.update(changes)
-    return encode_frame(fields)
+    return fields
+
+
+def hello_frame(root: Path, *, remove: tuple[str, ...] = (), **changes: object) -> bytes:
+    return encode_frame(hello_fields(root, remove=remove, **changes))
+
+
+def read_bounded(fd: int, count: int) -> bytes:
+    """Read from a pipe, failing rather than waiting past the process timeout."""
+    ready, _, _ = select.select([fd], [], [], PROCESS_TIMEOUT)
+    if not ready:
+        raise TimeoutError("the worker sent nothing within the timeout")
+    return os.read(fd, count)
+
+
+def worker_env(**extra: str) -> dict[str, str]:
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": os.pathsep.join(entry for entry in sys.path if entry),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "LANG": "C.UTF-8",
+    }
+    env.update(extra)
+    return env
+
+
+def spawn_worker(
+    root: Path,
+    env: dict[str, str],
+    pass_fds: tuple[int, ...],
+    stdin: int,
+) -> subprocess.Popen[bytes]:
+    with (root / "worker-stderr.txt").open("wb") as stderr:
+        return subprocess.Popen(
+            [sys.executable, "-B", "-m", WORKER_MODULE, "sample_plugin:SamplePlugin"],
+            stdin=stdin,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+            pass_fds=pass_fds,
+            env=env,
+            cwd=str(root),
+        )
+
+
+@contextmanager
+def launched(process: subprocess.Popen[bytes]) -> Iterator[subprocess.Popen[bytes]]:
+    """Kill the worker at the end of the block if it is still running."""
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
 
 
 @dataclass
@@ -68,12 +134,17 @@ class RawWorker:
         while view:
             view = view[os.write(self.frames_in, view) :]
 
+    def close_frames(self) -> None:
+        if self.frames_in >= 0:
+            os.close(self.frames_in)
+            self.frames_in = -1
+
     def close_stdin(self) -> None:
         if self.stdin >= 0:
             os.close(self.stdin)
             self.stdin = -1
 
-    def wait(self, timeout: float = 10.0) -> int:
+    def wait(self, timeout: float = PROCESS_TIMEOUT) -> int:
         return self.process.wait(timeout=timeout)
 
 
@@ -82,24 +153,8 @@ def raw_worker(root: Path) -> Iterator[RawWorker]:
     in_read, in_write = os.pipe()
     out_read, out_write = os.pipe()
     stdin_read, stdin_write = os.pipe()
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "PYTHONPATH": os.pathsep.join(entry for entry in sys.path if entry),
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "LANG": "C.UTF-8",
-        ENV_FD_IN: str(in_read),
-        ENV_FD_OUT: str(out_write),
-    }
-    with (root / "worker-stderr.txt").open("wb") as stderr:
-        process = subprocess.Popen(
-            [sys.executable, "-B", "-m", WORKER_MODULE, "sample_plugin:SamplePlugin"],
-            stdin=stdin_read,
-            stdout=subprocess.DEVNULL,
-            stderr=stderr,
-            pass_fds=(in_read, out_write),
-            env=env,
-            cwd=str(root),
-        )
+    env = worker_env(**{ENV_FD_IN: str(in_read), ENV_FD_OUT: str(out_write)})
+    process = spawn_worker(root, env, (in_read, out_write), stdin_read)
     os.close(in_read)
     os.close(out_write)
     os.close(stdin_read)
@@ -108,7 +163,7 @@ def raw_worker(root: Path) -> Iterator[RawWorker]:
         yield worker
     finally:
         worker.close_stdin()
-        os.close(in_write)
+        worker.close_frames()
         os.close(out_read)
         if process.poll() is None:
             process.kill()
@@ -293,6 +348,18 @@ def test_unknown_operation_is_internal(host: FakeHost) -> None:
     assert "unknown operation" in outcome.frame["message"]
 
 
+def test_unknown_operation_message_repeats_at_most_64_characters_of_the_name(
+    host: FakeHost,
+) -> None:
+    host.start()
+    outcome = host.call("no_such_" + "x" * 5000)
+    assert outcome.kind == "error"
+    assert outcome.frame is not None
+    message = outcome.frame["message"]
+    assert "unknown operation" in message
+    assert "x" * 65 not in message
+
+
 def test_every_operation_sees_the_folders_from_hello(host: FakeHost) -> None:
     ack = host.start()
     assert ack is not None
@@ -312,6 +379,7 @@ def test_end_of_input_makes_the_worker_exit_zero(host: FakeHost) -> None:
 def test_shutdown_frame_makes_the_worker_exit_zero(host: FakeHost) -> None:
     host.start()
     host.send_shutdown()
+    assert host.wait_for_exit(timeout=5.0) == 0
     assert host.close() == 0
 
 
@@ -349,9 +417,112 @@ def test_end_of_standard_input_before_hello_exits_zero(tmp_path: Path) -> None:
         assert worker.wait() == 0
 
 
+def test_end_of_the_frame_stream_before_hello_exits_zero(tmp_path: Path) -> None:
+    with raw_worker(tmp_path) as worker:
+        worker.close_frames()
+        assert worker.wait() == 0
+
+
+def test_a_directory_as_the_frame_descriptor_exits_2(tmp_path: Path) -> None:
+    directory = os.open(tmp_path, os.O_RDONLY)
+    out_read, out_write = os.pipe()
+    try:
+        env = worker_env(**{ENV_FD_IN: str(directory), ENV_FD_OUT: str(out_write)})
+        process = spawn_worker(tmp_path, env, (directory, out_write), subprocess.DEVNULL)
+        with launched(process):
+            assert process.wait(timeout=PROCESS_TIMEOUT) == 2
+    finally:
+        os.close(directory)
+        os.close(out_read)
+        os.close(out_write)
+
+
+def test_a_closed_frame_descriptor_exits_2_within_a_bounded_time(tmp_path: Path) -> None:
+    closed_read, closed_write = os.pipe()
+    os.close(closed_read)
+    os.close(closed_write)
+    out_read, out_write = os.pipe()
+    try:
+        env = worker_env(**{ENV_FD_IN: str(closed_read), ENV_FD_OUT: str(out_write)})
+        process = spawn_worker(tmp_path, env, (out_write,), subprocess.DEVNULL)
+        with launched(process):
+            assert process.wait(timeout=PROCESS_TIMEOUT) == 2
+    finally:
+        os.close(out_read)
+        os.close(out_write)
+
+
+def test_a_frame_descriptor_at_or_above_1024_is_served(tmp_path: Path) -> None:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = 1100
+    if hard != resource.RLIM_INFINITY and hard < target:
+        pytest.skip(f"the hard descriptor limit {hard} is below {target}")
+    if soft < target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    fds: list[int] = []
+    try:
+        in_read, in_write = os.pipe()
+        out_read, out_write = os.pipe()
+        stdin_read, stdin_write = os.pipe()
+        fds.extend([in_write, out_read, stdin_write])
+        high_in = fcntl.fcntl(in_read, fcntl.F_DUPFD, 1024)
+        os.close(in_read)
+        high_out = fcntl.fcntl(out_write, fcntl.F_DUPFD, 1024)
+        os.close(out_write)
+        fds.extend([high_in, high_out])
+        env = worker_env(**{ENV_FD_IN: str(high_in), ENV_FD_OUT: str(high_out)})
+        process = spawn_worker(tmp_path, env, (high_in, high_out), stdin_read)
+        os.close(stdin_read)
+        worker = RawWorker(process, in_write, stdin_write)
+        with launched(process):
+            worker.send(hello_frame(tmp_path))
+            ack = FrameReader(lambda count: read_bounded(out_read, count)).read_frame()
+            assert ack is not None
+            assert ack["t"] == "hello_ack"
+            worker.send(encode_frame({"t": "shutdown", "op": ""}))
+            assert process.wait(timeout=PROCESS_TIMEOUT) == 0
+    finally:
+        for fd in fds:
+            os.close(fd)
+        if (soft, hard) != resource.getrlimit(resource.RLIMIT_NOFILE):
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_heartbeat_interval_of_1e400_exits_76(tmp_path: Path) -> None:
+    text = json.dumps(hello_fields(tmp_path), separators=(",", ":"))
+    payload = text.replace('"heartbeat_interval":1.0', '"heartbeat_interval":1e400')
+    assert payload != text
+    with raw_worker(tmp_path) as worker:
+        worker.send(framed(payload.encode("utf-8")))
+        worker.close_stdin()
+        assert worker.wait() == 76
+
+
+def test_heartbeat_interval_with_400_digits_exits_76(tmp_path: Path) -> None:
+    with raw_worker(tmp_path) as worker:
+        worker.send(hello_frame(tmp_path, heartbeat_interval=int("1" * 400)))
+        worker.close_stdin()
+        assert worker.wait() == 76
+
+
+@pytest.mark.parametrize("protocol", [1.0, "1", None])
+def test_hello_with_a_non_integer_protocol_exits_76(tmp_path: Path, protocol: object) -> None:
+    with raw_worker(tmp_path) as worker:
+        worker.send(hello_frame(tmp_path, protocol=protocol))
+        worker.close_stdin()
+        assert worker.wait() == 76
+
+
 def test_hello_with_a_boolean_protocol_exits_76(tmp_path: Path) -> None:
     with raw_worker(tmp_path) as worker:
         worker.send(hello_frame(tmp_path, protocol=True))
+        worker.close_stdin()
+        assert worker.wait() == 76
+
+
+def test_hello_without_protocol_exits_76(tmp_path: Path) -> None:
+    with raw_worker(tmp_path) as worker:
+        worker.send(hello_frame(tmp_path, remove=("protocol",)))
         worker.close_stdin()
         assert worker.wait() == 76
 
@@ -361,6 +532,21 @@ def test_hello_without_max_in_flight_exits_76(tmp_path: Path) -> None:
         worker.send(hello_frame(tmp_path, remove=("max_in_flight",)))
         worker.close_stdin()
         assert worker.wait() == 76
+
+
+def test_protocol_error_wins_over_end_of_standard_input_five_times(tmp_path: Path) -> None:
+    # The host closes standard input as it closes the frame stream. The protocol
+    # error must still decide the status on every attempt.
+    for attempt in range(5):
+        with FakeHost(
+            SamplePlugin,
+            kind_api="sample.v1",
+            root=tmp_path / f"race-{attempt}",
+            timeout=10.0,
+        ) as fake:
+            fake.start()
+            fake.send_raw(b"\x00\x00\x00\x00")
+            assert fake.close() == 76
 
 
 def test_plugin_defined_in_a_function_cannot_run_as_a_worker(tmp_path: Path) -> None:
