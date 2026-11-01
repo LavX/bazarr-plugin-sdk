@@ -19,7 +19,8 @@ import os
 import sys
 import threading
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -146,11 +147,21 @@ def _coerce_result(value: object) -> Result:
 
 
 class _Writer:
-    """Writes whole frames to the host descriptor. One lock keeps frames from interleaving."""
+    """Writes whole frames to the host descriptor. One lock keeps frames from interleaving.
+
+    The lock is re-entrant so that a frame and the chunks of its body can be
+    written as one unit with ``batch``.
+    """
 
     def __init__(self, fd: int) -> None:
         self._fd = fd
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """Hold the lock while the caller writes several frames as one unit."""
+        with self._lock:
+            yield
 
     def write(self, data: bytes) -> None:
         view = memoryview(data)
@@ -527,19 +538,24 @@ class _Worker:
     # ----- writing --------------------------------------------------------
 
     def write_frame(self, frame: Mapping[str, Any], body: bytes | None = None) -> None:
-        """Write one frame, then its body as chunks when a body is given."""
-        self._writer.write(encode_frame(frame, limits=self._limits))
-        if body is not None:
-            owner = str(frame["t"])
-            request_id = frame.get("req")
-            for chunk in iter_body_frames(
-                of=owner,
-                op=str(frame["op"]),
-                data=body,
-                req=request_id if isinstance(request_id, str) else None,
-                limits=self._limits,
-            ):
-                self._writer.write(encode_frame(chunk, limits=self._limits))
+        """Write one frame, then its body as chunks when a body is given.
+
+        The frame and its chunks are written under one lock, so no other frame
+        can fall between them.
+        """
+        with self._writer.batch():
+            self._writer.write(encode_frame(frame, limits=self._limits))
+            if body is not None:
+                owner = str(frame["t"])
+                request_id = frame.get("req")
+                for chunk in iter_body_frames(
+                    of=owner,
+                    op=str(frame["op"]),
+                    data=body,
+                    req=request_id if isinstance(request_id, str) else None,
+                    limits=self._limits,
+                ):
+                    self._writer.write(encode_frame(chunk, limits=self._limits))
 
     def send(self, frame: Mapping[str, Any]) -> None:
         """Channel method: write a frame without waiting for an answer."""
