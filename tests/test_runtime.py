@@ -343,6 +343,26 @@ def test_steady_state_frame_the_decoder_refuses_exits_76(host: FakeHost, payload
     assert host.close() == 76
 
 
+def test_end_of_standard_input_before_hello_exits_zero(tmp_path: Path) -> None:
+    with raw_worker(tmp_path) as worker:
+        worker.close_stdin()
+        assert worker.wait() == 0
+
+
+def test_hello_with_a_boolean_protocol_exits_76(tmp_path: Path) -> None:
+    with raw_worker(tmp_path) as worker:
+        worker.send(hello_frame(tmp_path, protocol=True))
+        worker.close_stdin()
+        assert worker.wait() == 76
+
+
+def test_hello_without_max_in_flight_exits_76(tmp_path: Path) -> None:
+    with raw_worker(tmp_path) as worker:
+        worker.send(hello_frame(tmp_path, remove=("max_in_flight",)))
+        worker.close_stdin()
+        assert worker.wait() == 76
+
+
 def test_plugin_defined_in_a_function_cannot_run_as_a_worker(tmp_path: Path) -> None:
     class Local(SamplePlugin):
         pass

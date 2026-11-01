@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import logging
 import os
+import select
 import sys
 import threading
 import traceback
@@ -68,6 +69,7 @@ __all__ = [
 
 ENV_FD_IN = "BAZARR_PLUGIN_FD_IN"
 ENV_FD_OUT = "BAZARR_PLUGIN_FD_OUT"
+_STDIN_FD = 0
 
 EXIT_OK = 0
 EXIT_ENVIRONMENT = 2
@@ -196,7 +198,7 @@ class _Worker:
         self._limits: Limits = DEFAULT_LIMITS
         self._folders: Folders | None = None
         self._heartbeat_interval = 0.0
-        self._max_in_flight = 1
+        self._max_in_flight: int  # set by the handshake, which requires the hello key
         self._plugin: Plugin | None = None
         self._active: dict[str, _Active] = {}
         self._pending: dict[str, asyncio.Future[Mapping[str, Any]]] = {}
@@ -209,7 +211,7 @@ class _Worker:
     # ----- start-up -------------------------------------------------------
 
     def run(self) -> int:
-        handshake_reader = FrameReader(self._read_input)
+        handshake_reader = FrameReader(self._read_before_hello)
         status = self._handshake(handshake_reader)
         if status is not None:
             return status
@@ -219,17 +221,40 @@ class _Worker:
     def _read_input(self, count: int) -> bytes:
         return os.read(self._fd_in, count)
 
+    def _read_before_hello(self, count: int) -> bytes:
+        """Read the handshake from the frame descriptor while watching standard input.
+
+        End of standard input before hello ends the worker, as it does after
+        hello. Bytes that arrive on standard input are discarded.
+        """
+        while True:
+            try:
+                ready, _, _ = select.select([self._fd_in, _STDIN_FD], [], [])
+                if self._fd_in in ready:
+                    return os.read(self._fd_in, count)
+                if not os.read(_STDIN_FD, 1):
+                    raise HostGone("standard input closed before hello")
+            except OSError as exc:
+                raise HostGone(f"standard input failed before hello: {exc}") from exc
+
     def _handshake(self, reader: FrameReader) -> int | None:
         try:
             hello = reader.read_frame()
         except FrameError as exc:
             _report(f"plugin worker: protocol error before hello: {exc}")
             return EXIT_PROTOCOL
+        except HostGone as exc:
+            _report(f"plugin worker: {exc}")
+            return EXIT_OK
         if hello is None or hello.get("t") != "hello":
             _report("plugin worker: the first frame must be hello")
             return EXIT_PROTOCOL
-        if hello.get("protocol") != PROTOCOL_VERSION:
-            _report(f"plugin worker: host protocol {hello.get('protocol')!r} is not served")
+        protocol = hello.get("protocol")
+        if isinstance(protocol, bool):
+            _report("plugin worker: malformed hello: protocol must be an integer")
+            return EXIT_PROTOCOL
+        if protocol != PROTOCOL_VERSION:
+            _report(f"plugin worker: host protocol {protocol!r} is not served")
             return EXIT_CONTRACT_NOT_SERVED
         kind_api = self._plugin_class.kind_api
         if hello.get("kind_api") != kind_api:
