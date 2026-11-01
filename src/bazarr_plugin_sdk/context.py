@@ -204,8 +204,8 @@ class PluginContext:
         """Reserve ``amount`` of spend for ``model`` and return the reservation id.
 
         Returns None when the host does not grant a reservation. Raises
-        ``PluginError`` with the ``cancelled`` code when the host refuses the
-        reservation because the operation was cancelled.
+        ``PluginError`` with the code the host reports when it refuses the
+        reservation.
         """
         self._ensure_open()
         frame = {
