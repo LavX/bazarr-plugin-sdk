@@ -170,8 +170,8 @@ chunks of up to 1 MiB and reassembles them on the host side.
 | Status | Meaning |
 | --- | --- |
 | 0 | Orderly shutdown, or end of input: the host closed the frame stream or standard input, before or after `hello`, or closed the pipe the worker writes to. |
-| 2 | The environment is wrong, for example a missing, invalid or directory descriptor variable, or no `kind_api`. Also a failed read on the frame descriptor or on standard input. |
-| 76 | Protocol error, such as a malformed frame or hello, or a result that cannot be encoded. |
+| 2 | The environment is wrong, for example a missing, invalid or directory descriptor variable, or no `kind_api`. Also a failed stdout redirect, or a failed read on the frame descriptor or on standard input. |
+| 76 | Protocol error, such as a malformed frame or hello, a result that cannot be encoded, or an unexpected failure in the frame reader. |
 | 78 | The host asked for a protocol version or a kind this worker does not serve. |
 
 After a shutdown begins, the worker has two seconds to finish, including its

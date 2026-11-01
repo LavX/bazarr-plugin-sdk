@@ -834,8 +834,9 @@ def serve(plugin_class: type[Plugin]) -> int:
       end of standard input (before or after hello), or a closed host pipe while
       the worker writes.
     - 2 when the environment is wrong (a descriptor variable is missing,
-      malformed, not open or a directory, or the class sets no ``kind_api``), or
-      when a read fails on the frame or standard input descriptor.
+      malformed, not open or a directory, or the class sets no ``kind_api``),
+      when standard output cannot be redirected to standard error, or when a
+      read fails on the frame or standard input descriptor.
     - 76 on a protocol error.
     - 78 when the host asks for a protocol or a kind this worker does not serve.
 

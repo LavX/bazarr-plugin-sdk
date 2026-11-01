@@ -182,8 +182,8 @@ Sent after `hello` is accepted and the plugin object is created.
 | Status | Meaning |
 | --- | --- |
 | 0 | Orderly shutdown; end of the frame stream, before or after `hello`; end of standard input, before or after `hello`; the host pipe closed while the worker wrote a frame, including `hello_ack`. |
-| 2 | The environment is wrong: a descriptor variable is missing, malformed, above 2147483647, not open or a directory; the class sets no `kind_api`; the plugin constructor raised; or a read fails on the frame descriptor or on standard input. |
-| 76 | Protocol error: the first frame is not `hello`; `hello` is malformed (including a `protocol` that is not an integer, a `heartbeat_interval` that is not a finite number above zero, or a missing `max_in_flight`); a frame is malformed, nests too deep, has an id that is too long, or is too large; a frame type is not allowed in this direction; an operation id is started twice; or a result cannot be encoded. |
+| 2 | The environment is wrong: a descriptor variable is missing, malformed, above 2147483647, not open or a directory; the class sets no `kind_api`; standard output cannot be redirected to standard error; the plugin constructor raised; or a read fails on the frame descriptor or on standard input. |
+| 76 | Protocol error: the first frame is not `hello`; `hello` is malformed (including a `protocol` that is not an integer, a `heartbeat_interval` that is not a finite number above zero, or a missing `max_in_flight`); a frame is malformed, nests too deep, has an id that is too long, or is too large; a frame type is not allowed in this direction; an operation id is started twice; or a result cannot be encoded; or the frame reader fails with an unexpected error. |
 | 78 | The host asked for a protocol version or a kind this worker does not serve. |
 
 A read error is never a clean exit: a failed read on either descriptor exits
