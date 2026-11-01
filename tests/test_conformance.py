@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sample_plugin import SamplePlugin
@@ -129,13 +129,21 @@ def test_a_secret_stored_in_a_checkpoint_fails_the_secrets_check(tmp_path: Path)
     assert result.detail == "the worker sent the secret in a body chunk"
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_cancel_check_requires_the_cancel_frame_to_be_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def record_without_writing(self: FakeHost, op: str, *, abandon: bool = False) -> None:
-        self.cancel_times[op] = time.monotonic()
+    # The cancel is sent from a timer thread, so the refused write ends that thread with an error.
+    real_send = FakeHost._send
 
-    monkeypatch.setattr(FakeHost, "cancel", record_without_writing)
+    def refuse_cancel_frame(
+        self: FakeHost, frame: dict[str, Any], body: bytes | None = None
+    ) -> None:
+        if frame.get("t") == "cancel":
+            raise OSError("the cancel frame cannot be written")
+        real_send(self, frame, body)
+
+    monkeypatch.setattr(FakeHost, "_send", refuse_cancel_frame)
     fixtures = {**FIXTURES, "cancel": {"method": "self_cancel"}}
     report = run_conformance(SamplePlugin, "sample.v1", fixtures, root=tmp_path)
     result = named(report, "cancel mid-call")
