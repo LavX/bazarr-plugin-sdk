@@ -32,6 +32,10 @@ class SamplePlugin(Plugin):
         "folders",
         "leak_checkpoint",
         "self_cancel",
+        "ignore_cancel",
+        "nan_result",
+        "oversize_value",
+        "oversize_error",
     )
 
     async def echo(self, ctx: PluginContext, request: Request) -> Result:
@@ -99,3 +103,25 @@ class SamplePlugin(Plugin):
         # Gives up with the cancelled code without reading the host's cancel flag.
         await asyncio.sleep(0.5)
         raise PluginError(CANCELLED, "gave up")
+
+    async def ignore_cancel(self, ctx: PluginContext, request: Request) -> None:
+        # Keeps sleeping after each cancellation, so only the teardown watchdog can end the worker.
+        while True:
+            try:
+                await asyncio.sleep(60.0)
+            except asyncio.CancelledError:
+                continue
+
+    async def nan_result(self, ctx: PluginContext, request: Request) -> dict[str, float]:
+        # NaN has no JSON form, so the result frame cannot be encoded.
+        return {"x": float("nan")}
+
+    async def oversize_value(self, ctx: PluginContext, request: Request) -> dict[str, str]:
+        # Larger than one control frame, with no body to carry the value.
+        return {"big": "a" * 70000}
+
+    async def oversize_error(self, ctx: PluginContext, request: Request) -> None:
+        # The error frame cannot fit in one control frame, so the worker sends its fallback.
+        raise PluginError(
+            INVALID_CONFIG, "settings incomplete", field_errors={"api_key": "x" * 70000}
+        )

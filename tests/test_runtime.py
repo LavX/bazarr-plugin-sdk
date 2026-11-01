@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
+import io
 import json
 import os
 import resource
@@ -14,16 +16,19 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sample_plugin import MIB, SamplePlugin
 
-from bazarr_plugin_sdk.runtime import ENV_FD_IN, ENV_FD_OUT
+from bazarr_plugin_sdk.errors import HostGone
+from bazarr_plugin_sdk.runtime import ENV_FD_IN, ENV_FD_OUT, _Worker, serve
 from bazarr_plugin_sdk.testing import CallOutcome, FakeHost
 from bazarr_plugin_sdk.testing.fake_host import WORKER_MODULE, plugin_spec
 from bazarr_plugin_sdk.wire import (
     DEFAULT_LIMITS,
     PROTOCOL_VERSION,
+    FrameError,
     FrameReader,
     encode_frame,
 )
@@ -339,6 +344,32 @@ def test_oversize_result_is_refused_with_internal(host: FakeHost) -> None:
     assert outcome.body is None
 
 
+def test_result_too_large_for_one_control_frame_is_refused_with_internal(host: FakeHost) -> None:
+    host.start()
+    outcome = host.call("oversize_value")
+    assert outcome.kind == "error"
+    assert outcome.code == "internal"
+    assert outcome.frame is not None
+    assert outcome.frame["message"] == "the result is too large to send"
+
+
+def test_error_too_large_for_one_control_frame_is_replaced_by_the_fallback(host: FakeHost) -> None:
+    host.start()
+    outcome = host.call("oversize_error")
+    assert outcome.kind == "error"
+    assert outcome.code == "internal"
+    assert outcome.frame is not None
+    assert outcome.frame["message"] == "the error details are too large to send"
+
+
+def test_result_that_cannot_be_encoded_ends_the_worker_with_status_76(host: FakeHost) -> None:
+    host.start()
+    outcome = host.call("nan_result")
+    assert outcome.kind == "closed"
+    assert outcome.frame is None
+    assert host.wait_for_exit(timeout=5.0) == 76
+
+
 def test_unknown_operation_is_internal(host: FakeHost) -> None:
     host.start()
     outcome = host.call("no_such_operation")
@@ -381,6 +412,25 @@ def test_shutdown_frame_makes_the_worker_exit_zero(host: FakeHost) -> None:
     host.send_shutdown()
     assert host.wait_for_exit(timeout=5.0) == 0
     assert host.close() == 0
+
+
+def test_operation_that_ignores_cancellation_is_ended_by_the_teardown_watchdog(
+    host: FakeHost,
+) -> None:
+    host.start()
+    timers: list[threading.Timer] = []
+
+    def arm_shutdown(fake: FakeHost) -> None:
+        timer = threading.Timer(0.3, fake.send_shutdown)
+        timers.append(timer)
+        timer.start()
+
+    # The operation is in flight when shutdown begins, and it never returns.
+    outcome = host.call("ignore_cancel", after_send=arm_shutdown)
+    for timer in timers:
+        timer.cancel()
+    assert outcome.kind == "closed"
+    assert host.wait_for_exit(timeout=6.0) == 0
 
 
 def test_handshake_for_a_kind_the_worker_does_not_serve_exits_78(tmp_path: Path) -> None:
@@ -556,3 +606,150 @@ def test_plugin_defined_in_a_function_cannot_run_as_a_worker(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="module level"):
         plugin_spec(Local)
     assert plugin_spec(SamplePlugin) == "sample_plugin:SamplePlugin"
+
+
+def test_failed_stdout_redirect_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_dup2 = os.dup2
+
+    def refuse_redirect(source: int, target: int, *args: Any, **kwargs: Any) -> int:
+        if (source, target) == (2, 1):
+            raise OSError("redirect refused")
+        return real_dup2(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "dup2", refuse_redirect)
+    in_read, in_write = os.pipe()
+    out_read, out_write = os.pipe()
+    monkeypatch.setenv(ENV_FD_IN, str(in_read))
+    monkeypatch.setenv(ENV_FD_OUT, str(out_write))
+    try:
+        assert serve(SamplePlugin) == 2
+    finally:
+        for fd in (in_read, in_write, out_read, out_write):
+            os.close(fd)
+
+
+def test_hello_ack_to_a_closed_host_pipe_exits_0(tmp_path: Path) -> None:
+    ack_read, ack_write = os.pipe()
+    os.close(ack_read)
+    try:
+        worker = _Worker(SamplePlugin, -1, ack_write)
+        handshake = FrameReader(io.BytesIO(hello_frame(tmp_path)).read)
+        assert worker._handshake(handshake) == 0
+    finally:
+        os.close(ack_write)
+
+
+def test_hello_ack_that_cannot_be_encoded_exits_76(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ack_read, ack_write = os.pipe()
+    try:
+        worker = _Worker(SamplePlugin, -1, ack_write)
+
+        def refuse_write(data: bytes) -> None:
+            raise FrameError("the acknowledgement cannot be encoded")
+
+        monkeypatch.setattr(worker._writer, "write", refuse_write)
+        handshake = FrameReader(io.BytesIO(hello_frame(tmp_path)).read)
+        assert worker._handshake(handshake) == 76
+    finally:
+        os.close(ack_read)
+        os.close(ack_write)
+
+
+class _BrokenReader:
+    """A frame reader that fails with an error that is neither a protocol nor a read error."""
+
+    def read_frame(self) -> None:
+        raise RuntimeError("reader broke")
+
+
+def _run_frame_reader(worker: _Worker, reader: Any) -> int:
+    """Run the worker's frame reader thread until it ends the worker, and return the status."""
+
+    async def main() -> int:
+        worker._loop = asyncio.get_running_loop()
+        worker._stop = asyncio.Event()
+        worker._reader = reader
+        thread = threading.Thread(target=worker._read_frames, daemon=True)
+        thread.start()
+        await asyncio.wait_for(worker._stop.wait(), timeout=PROCESS_TIMEOUT)
+        thread.join(PROCESS_TIMEOUT)
+        return worker._exit_code
+
+    return asyncio.run(main())
+
+
+def test_unexpected_frame_reader_failure_exits_76(capsys: pytest.CaptureFixture[str]) -> None:
+    worker = _Worker(SamplePlugin, -1, -1)
+    assert _run_frame_reader(worker, _BrokenReader()) == 76
+    assert "the frame reader failed: RuntimeError" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("state", ["write-fails", "ack-arrives"])
+def test_pending_request_entry_is_removed_however_the_request_ends(
+    state: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = _Worker(SamplePlugin, -1, -1)
+
+    async def main() -> None:
+        worker._loop = asyncio.get_running_loop()
+        worker._stop = asyncio.Event()
+        if state == "write-fails":
+
+            def refuse(frame: dict[str, Any], body: bytes | None = None) -> None:
+                raise HostGone("the host connection is closed")
+
+            monkeypatch.setattr(worker, "write_frame", refuse)
+            with pytest.raises(HostGone):
+                await worker.request({"t": "reserve", "op": "op-1"})
+        else:
+            monkeypatch.setattr(worker, "write_frame", lambda frame, body=None: None)
+            task = asyncio.create_task(worker.request({"t": "reserve", "op": "op-1"}))
+            await asyncio.sleep(0)
+            assert set(worker._pending) == {"1"}
+            worker._dispatch({"t": "ack", "op": "", "req": "1"}, None)
+            ack = await asyncio.wait_for(task, PROCESS_TIMEOUT)
+            assert ack["t"] == "ack"
+        assert worker._pending == {}
+
+    asyncio.run(main())
+
+
+class _ScriptedPoll:
+    """A poll object that reports the same ready descriptors on every call."""
+
+    def __init__(self, ready: list[tuple[int, int]]) -> None:
+        self._ready = ready
+
+    def register(self, fd: int, events: int) -> None:
+        return None
+
+    def poll(self, timeout: float | None = None) -> list[tuple[int, int]]:
+        return self._ready
+
+
+@pytest.mark.parametrize("descriptor", ["frame", "standard-input"])
+@pytest.mark.parametrize("event", [select.POLLNVAL, select.POLLERR], ids=["invalid", "error"])
+def test_broken_descriptor_while_waiting_for_hello_exits_2(
+    descriptor: str,
+    event: int,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    in_read, in_write = os.pipe()
+    out_read, out_write = os.pipe()
+    ready_fd = in_read if descriptor == "frame" else 0
+    monkeypatch.setattr(select, "poll", lambda: _ScriptedPoll([(ready_fd, event)]))
+    try:
+        worker = _Worker(SamplePlugin, in_read, out_write)
+        assert worker._handshake(FrameReader(worker._read_before_hello)) == 2
+    finally:
+        for fd in (in_read, in_write, out_read, out_write):
+            os.close(fd)
+    expected = (
+        "the frame descriptor cannot be read"
+        if descriptor == "frame"
+        else "standard input cannot be read"
+    )
+    assert expected in capsys.readouterr().err
