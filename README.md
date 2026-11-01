@@ -61,6 +61,10 @@ Each operation takes `(ctx, request)` and returns one of:
 - a `Result(value=..., body=...)`, when the result has a binary body;
 - None, which returns an empty result.
 
+The result value must be JSON that the protocol can carry, and it must fit in
+one 64 KiB control frame. A larger value becomes an `internal` error. A value
+that cannot be encoded as JSON ends the worker with status 76.
+
 An operation declared with `async def` receives a `PluginContext` and awaits
 its calls. An operation declared with plain `def` runs in a worker thread and
 receives a `BlockingContext`. Its awaited calls block the thread instead.
@@ -110,11 +114,15 @@ work. A long loop with no progress or heartbeat can be treated as stalled.
 When the host cancels an operation, the `cancelled` event is set. An operation
 declared with `async def` has the awaited call in progress interrupted. An
 operation declared with plain `def` keeps running on its thread after the
-cancel, and the SDK never joins that thread. Check `ctx.cancelled.is_set()`
-between steps of long work in both kinds.
+cancel, and the SDK never joins that thread. The host gets the cancelled error
+at once, and the thread's later context calls are refused. A plain `def`
+function that ignores cancellation keeps running until it returns, and a
+shutdown ends the process after two seconds whether or not it has returned.
+Check `ctx.cancelled.is_set()` between steps of long work in both kinds.
 
 `OperationAbandoned` is raised by context calls after the host has discarded
-the operation. Let it propagate. Retrying does not help.
+the operation, and after the operation has sent its result or error. Let it
+propagate. Retrying does not help.
 
 `HostGone` is raised when the host connection has closed. Let it propagate.
 
@@ -161,10 +169,14 @@ chunks of up to 1 MiB and reassembles them on the host side.
 
 | Status | Meaning |
 | --- | --- |
-| 0 | Orderly shutdown, or the host closed the connection or standard input, before or after `hello`. |
-| 2 | The environment is wrong, for example a missing descriptor variable or no `kind_api`. |
-| 76 | Protocol error. |
-| 78 | The host asked for a kind this worker does not serve. |
+| 0 | Orderly shutdown, or end of input: the host closed the frame stream or standard input, before or after `hello`, or closed the pipe the worker writes to. |
+| 2 | The environment is wrong, for example a missing, invalid or directory descriptor variable, or no `kind_api`. Also a failed read on the frame descriptor or on standard input. |
+| 76 | Protocol error, such as a malformed frame or hello, or a result that cannot be encoded. |
+| 78 | The host asked for a protocol version or a kind this worker does not serve. |
+
+After a shutdown begins, the worker has two seconds to finish, including its
+teardown. When the two seconds run out, the process ends with the status it has
+recorded so far. See [docs/protocol.md](docs/protocol.md) for the details.
 
 ## Testing your plugin
 
@@ -204,9 +216,10 @@ def test_conformance():
 ```
 
 The fixtures tell the suite which calls to make. A check whose fixture is
-missing is reported as skipped. The checks cover the handshake, the folders,
-secret handling, cancellation, heartbeats, unexpected exceptions and the result
-limit.
+missing is reported as skipped, and a skipped check makes the report not ok.
+Give all five fixtures to get an ok report. The checks cover the handshake, the
+folders, secret handling, cancellation, heartbeats, unexpected exceptions and
+the result limit.
 
 ## Protocol
 

@@ -14,13 +14,15 @@ The host starts the worker as a child process and passes two descriptors:
 | `BAZARR_PLUGIN_FD_IN` | host to worker | Frames the worker reads. |
 | `BAZARR_PLUGIN_FD_OUT` | worker to host | Frames the worker writes. |
 
-Both values are decimal descriptor numbers of 3 or more. The worker exits
-with status 2 when either variable is missing or malformed.
+Both values are decimal descriptor numbers from 3 to 2147483647. The worker
+exits with status 2 when either variable is missing or malformed, when a value
+is not an open descriptor, or when a value names a directory.
 
 Standard input is a liveness pipe. The host keeps it open for the life of the
 worker. When standard input reaches end of file, the worker exits with status
-0, whether or not `hello` has been received. The worker never reads frames from
-standard input. It discards any bytes that arrive there.
+0, whether or not `hello` has been received. A failed read on standard input
+exits with status 2. The worker never reads frames from standard input. It
+discards any bytes that arrive there.
 
 Standard output is redirected to standard error from the moment `serve()`
 starts. A plugin's `print` output and log records go to standard error, so a
@@ -49,18 +51,30 @@ Every frame is:
 
 A length of zero is an error. The JSON must not contain `NaN`, `Infinity` or
 `-Infinity`. A payload that the JSON decoder refuses, such as an integer with
-more digits than Python converts or nesting too deep to parse, is a malformed
-frame. Every frame object has:
+more digits than Python converts, is a malformed frame. Every frame object has:
 
 - `t`: the frame type, a string.
-- `op`: the operation id, a non-empty string. Connection frames (`hello`,
-  `hello_ack`, `shutdown`) use the empty string.
+- `op`: the operation id. It is text of at most 256 characters that encodes as
+  UTF-8 without lone surrogates. Operation frames need a non-empty `op`.
+  Connection frames (`hello`, `hello_ack`, `shutdown`) must use the empty
+  string. Any other value is a malformed frame.
+
+Request ids (`req`) follow the same rule as `op`: text of at most 256
+characters that encodes as UTF-8. A malformed id is a malformed frame.
+
+### Nesting
+
+Arrays and objects may nest at most 64 levels deep, and the frame object is
+level 1. A frame that nests deeper is malformed. The worker checks this when it
+reads a frame and before it encodes one, so it never sends a frame that it
+would refuse to read. A malformed frame from the host ends the worker with
+status 76.
 
 ### Size limits
 
 | Limit | Default | Applies to |
 | --- | --- | --- |
-| `control_frame_bytes` | 65,536 (64 KiB) | JSON payload of every frame except `chunk`. |
+| `control_frame_bytes` | 65,536 (64 KiB) | JSON payload of every frame except `chunk`. A result value is part of its `result` frame. |
 | `chunk_bytes` | 1,048,576 (1 MiB) | Decoded bytes in one `chunk` frame. |
 | `request_body_bytes` | 16 MiB | Decoded size of a call body. |
 | `result_body_bytes` | 16 MiB | Upper bound on a result body. |
@@ -86,7 +100,11 @@ must be positive integers. No other field is allowed.
 
 The result limit for one call is `min(result_body_bytes, max(result_floor_bytes,
 result_factor * request_body_length))`. A result body larger than this limit is
-replaced by an `internal` error.
+replaced by an `internal` error whose message is exactly:
+
+```text
+the result body exceeds the result limit
+```
 
 ## Bodies
 
@@ -128,12 +146,15 @@ The first frame on the channel. Any other first frame is a protocol error.
 }
 ```
 
-- `protocol` must be the integer `1`. A boolean is a malformed hello (status
-  76). Any other value that is not `1` is a version the worker does not serve
-  (status 78).
+- `protocol` must be the integer `1`. A missing value, a boolean, a float such
+  as `1.0`, or text is a malformed hello (status 76). An integer other than `1`
+  is a version the worker does not serve (status 78).
 - `kind_api` must equal the `kind_api` the worker class declares.
-- `heartbeat_interval` is a positive number of seconds. The worker stores it
-  and exposes it to plugin code. The worker never sends heartbeats on its own.
+- `heartbeat_interval` is a finite number of seconds above zero. The worker
+  stores it and exposes it to plugin code. The worker never sends heartbeats on
+  its own. A value that is not a number, is zero or below, is not finite (such
+  as `1e400`), or is too large to convert to a float is a malformed hello
+  (status 76).
 - `max_in_flight` is required. It is an integer of 1 or more. A hello without
   it is malformed and the worker exits with status 76.
 - Each folder value is an absolute path. The folders are fixed for the life
@@ -160,13 +181,14 @@ Sent after `hello` is accepted and the plugin object is created.
 
 | Status | Meaning |
 | --- | --- |
-| 0 | Orderly shutdown; end of the frame stream; end of standard input, before or after `hello`; the host pipe closed while the worker wrote a frame; or a read error on the frame descriptor. |
-| 2 | The environment is wrong: a descriptor variable is missing or invalid, the class sets no `kind_api`, or the plugin constructor raised. |
-| 76 | Protocol error: the first frame is not `hello`, `hello` is malformed, a frame is malformed or too large, a frame type is not allowed in this direction, or an operation id is started twice. |
+| 0 | Orderly shutdown; end of the frame stream, before or after `hello`; end of standard input, before or after `hello`; the host pipe closed while the worker wrote a frame, including `hello_ack`. |
+| 2 | The environment is wrong: a descriptor variable is missing, malformed, above 2147483647, not open or a directory; the class sets no `kind_api`; the plugin constructor raised; or a read fails on the frame descriptor or on standard input. |
+| 76 | Protocol error: the first frame is not `hello`; `hello` is malformed (including a `protocol` that is not an integer, a `heartbeat_interval` that is not a finite number above zero, or a missing `max_in_flight`); a frame is malformed, nests too deep, has an id that is too long, or is too large; a frame type is not allowed in this direction; an operation id is started twice; or a result cannot be encoded. |
 | 78 | The host asked for a protocol version or a kind this worker does not serve. |
 
-The worker writes a short reason to standard error before exiting with a
-non-zero status.
+A read error is never a clean exit: a failed read on either descriptor exits
+with status 2. The worker writes a short reason to standard error before
+exiting with a non-zero status.
 
 ## Calls (host to worker)
 
@@ -196,7 +218,11 @@ non-zero status.
 - Sets the operation's `cancelled` flag. The plugin observes the flag through
   its context. An `async` operation that is awaiting a context call is
   interrupted. A `def` operation keeps running on its thread after the cancel
-  and is never joined.
+  and is never joined. The host receives the `cancelled` error at once, and
+  the thread's later context calls are refused (see Ordering). A plain `def`
+  function that ignores cancellation keeps running until it returns. The
+  worker does not wait for it: a shutdown ends the process at its time bound
+  (see shutdown).
 - With `abandon` true the worker also sets the abandoned flag. The host must
   then ignore every later frame for that operation id. The worker stops the
   operation at its next context call and sends no further result frame for it.
@@ -227,8 +253,13 @@ The reply to an awaited worker frame. It carries the `req` the worker chose.
 {"t": "shutdown", "op": ""}
 ```
 
-The worker cancels its active operations, waits up to two seconds for them, and
-exits with status 0.
+The worker cancels its active operations and waits up to two seconds for them.
+The two seconds cover the whole teardown, including the asyncio cleanup that
+follows. A watchdog started at shutdown has the same bound: when it runs out,
+the worker flushes standard output and standard error and ends the process
+with the status recorded so far. After an orderly shutdown that status is 0.
+Operations still running at that point, such as a `def` function that ignores
+cancellation, are ended with the process.
 
 ### Frames not used in version 1
 
@@ -245,7 +276,8 @@ this document exits with status 76.
 ```
 
 `done` is a non-negative integer. `total` is a non-negative integer or null.
-`message` is text. No answer is sent.
+`message` is text. No answer is sent. The worker does not send a `progress`
+frame for an operation after that operation's final frame (see Ordering).
 
 ### heartbeat
 
@@ -294,6 +326,9 @@ after storing the body.
 
 `value` is a JSON object or null. When `body` is true, the body follows as
 chunks with `of` set to `result`. A result is sent at most once per operation.
+A value too large for one control frame becomes an `internal` error with the
+message `the result is too large to send`. A value that cannot be encoded as
+JSON ends the worker with status 76, because the host cannot be answered.
 
 ### error
 
@@ -336,9 +371,11 @@ exception messages.
 
 ## Ordering
 
-- An operation sends at most one `result` or `error` frame. Plugin code should
-  not send `progress` or `heartbeat` after it returns; the worker does not
-  check this.
+- An operation sends at most one `result` or `error` frame. Once that final
+  frame is sent, the worker refuses every later frame for the same operation
+  id: `progress`, `heartbeat`, `reserve`, `usage` and `checkpoint` raise
+  `OperationAbandoned` in plugin code and nothing is written. The worker frees
+  the id at that point, so a later call may reuse it.
 - Awaited frames (`reserve`, `usage`, `checkpoint`) are answered in any order,
   each matched by `req`.
 - Frames for different operation ids may interleave, except that a body's
