@@ -1,7 +1,7 @@
 """Replays the shared transcripts in tests/transcripts through the frame codec.
 
 The same JSON files are the test vectors for the host. Each frame must survive
-an encode and decode round trip, each body must reassemble, and each refusal
+an encode followed by a decode, each body must reassemble, and each refusal
 must happen after exactly the bytes the transcript names.
 """
 
