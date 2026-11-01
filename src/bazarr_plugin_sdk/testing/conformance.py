@@ -4,7 +4,7 @@
 and runs the checks that every kind shares:
 
 - handshake agreement, and exit status 78 for a kind the worker does not serve
-- the folders are fixed for the worker and TMPDIR points at the temp folder
+- hello_ack reports the folders, and TMPDIR points at the temp folder
 - secrets appear only in the ``secrets`` object of a call, never in a frame or
   in stderr
 - a cancel during a call ends it with the ``cancelled`` code within 5 seconds
@@ -15,7 +15,8 @@ and runs the checks that every kind shares:
 
 The checks that need a call take it from a fixture. A fixture is a mapping
 with ``method`` (text), and optionally ``params`` (a mapping) and ``body``
-(bytes). A check whose fixture is missing is reported as skipped.
+(bytes). A check whose fixture is missing is reported as skipped. A skipped
+check was not run, so the report is not ok until every check has passed.
 """
 
 from __future__ import annotations
@@ -25,9 +26,11 @@ import json
 import secrets
 import tempfile
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -68,13 +71,17 @@ class CheckResult:
 
 @dataclass
 class ConformanceReport:
-    """All check results for one plugin. ``ok`` is False when any check failed."""
+    """All check results for one plugin.
+
+    ``ok`` is True only when every check passed. A failed check and a skipped
+    check both make the report not ok.
+    """
 
     results: list[CheckResult] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return all(result.status != "fail" for result in self.results)
+        return all(result.status == "pass" for result in self.results)
 
     @property
     def failures(self) -> list[CheckResult]:
@@ -99,6 +106,9 @@ class ConformanceReport:
         lines.append(
             f"{len(self.passed)} passed, {len(self.failures)} failed, {len(self.skipped)} skipped"
         )
+        if self.skipped:
+            names = ", ".join(result.name for result in self.skipped)
+            lines.append(f"not run, so the report is not ok: {names}")
         return "\n".join(lines)
 
 
@@ -162,6 +172,7 @@ class _Suite:
         op: str | None = None,
         secrets: Mapping[str, str] | None = None,
         after_send: Any = None,
+        deadline: float | None = None,
     ) -> CallOutcome:
         fixture = self._fixtures[key]
         return host.call(
@@ -171,6 +182,7 @@ class _Suite:
             secrets=secrets,
             op=op or f"conformance-{key}",
             after_send=after_send,
+            deadline=deadline,
         )
 
     def run(self) -> ConformanceReport:
@@ -189,7 +201,7 @@ class _Suite:
             )
         checks = [
             ("handshake agreement", self.check_handshake),
-            ("folders fixed for the worker", self.check_folders),
+            ("handshake reports folders and environment", self.check_folders),
             ("secrets only in the secrets object", self.check_secrets),
             ("cancel mid-call", self.check_cancel),
             ("heartbeat cadence", self.check_heartbeat),
@@ -267,9 +279,11 @@ class _Suite:
             if SECRET_SENTINEL in json.dumps(frame):
                 return "fail", f"the worker sent the secret in a {frame.get('t')} frame"
         # Chunk data is base64 on the wire, so the scan works on the decoded bytes.
-        # Joining the chunks also catches a secret split across two chunks.
+        # Joining the chunks also catches a secret split across two chunks. Every
+        # body the worker sends, a result or a checkpoint, travels as chunks, so
+        # this scan covers those bodies too.
         decoded_chunks = b"".join(
-            base64.b64decode(str(frame.get("data", "")))
+            base64.b64decode(str(frame.get("data", "")), validate=True)
             for frame in host.received
             if frame.get("t") == "chunk"
         )
@@ -277,9 +291,6 @@ class _Suite:
             return "fail", "the worker sent the secret in a body chunk"
         if outcome.body is not None and _SECRET_BYTES in outcome.body:
             return "fail", "the worker sent the secret in a result body"
-        for body in host.checkpoints:
-            if _SECRET_BYTES in body:
-                return "fail", "the worker stored the secret in a checkpoint"
         return "pass", ""
 
     def check_cancel(self) -> tuple[str, str]:
@@ -293,11 +304,18 @@ class _Suite:
             timers.append(timer)
             timer.start()
 
+        # One absolute deadline bounds the whole call, however many frames the
+        # worker sends while it winds down.
+        deadline = time.monotonic() + CANCEL_DELAY_SECONDS + CANCEL_BUDGET_SECONDS
         with self._session("cancel") as host:
             host.start()
-            outcome = self._call(host, "cancel", op=op, after_send=arm)
-            for timer in timers:
-                timer.cancel()
+            try:
+                outcome = self._call(host, "cancel", op=op, after_send=arm, deadline=deadline)
+            except TimeoutError:
+                return "fail", "the call did not end before the cancel deadline"
+            finally:
+                for timer in timers:
+                    timer.cancel()
             if "valid" in self._fixtures and outcome.kind == "error":
                 follow_up = host.call(
                     self._fixtures["valid"]["method"],
@@ -341,9 +359,7 @@ class _Suite:
         if len(beats) < 2:
             return "fail", f"the worker sent {len(beats)} heartbeats, expected at least two"
         points = [outcome.started_at, *beats, outcome.finished_at]
-        longest_silence = max(
-            later - earlier for earlier, later in zip(points, points[1:], strict=True)
-        )
+        longest_silence = max(later - earlier for earlier, later in pairwise(points))
         limit = STALL_INTERVALS * CONFORMANCE_HEARTBEAT_INTERVAL
         if longest_silence >= limit:
             return "fail", f"{longest_silence:.2f} seconds without a heartbeat (limit {limit})"
@@ -409,6 +425,10 @@ def run_conformance(
     check names (``valid``, ``cancel``, ``heartbeat``, ``raise``, ``oversize``)
     to calls the plugin understands. ``root`` is a scratch folder; a temporary
     one is used when it is omitted.
+
+    The report is ok only when every check passed. A check without its fixture
+    is skipped, and a skipped check makes the report not ok. Give all five
+    fixtures to get an ok report.
 
     Use it from a test::
 

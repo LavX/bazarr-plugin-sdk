@@ -30,6 +30,23 @@ def test_sample_plugin_passes_every_check(tmp_path: Path) -> None:
     assert "oversize result refused" in names
 
 
+def test_sample_plugin_heartbeat_check_passes(tmp_path: Path) -> None:
+    report = run_conformance(SamplePlugin, "sample.v1", FIXTURES, root=tmp_path)
+    result = named(report, "heartbeat cadence")
+    assert result.status == "pass", result.detail
+
+
+def test_a_report_with_only_skipped_checks_is_not_ok() -> None:
+    report = ConformanceReport([CheckResult("cancel mid-call", "skip", "no fixture")])
+    assert not report.ok
+    assert report.failures == []
+
+
+def test_a_report_with_only_passes_is_ok() -> None:
+    report = ConformanceReport([CheckResult("handshake agreement", "pass")])
+    assert report.ok
+
+
 def test_a_kind_the_plugin_does_not_serve_fails_the_handshake(tmp_path: Path) -> None:
     report = run_conformance(SamplePlugin, "translator.v1", FIXTURES, root=tmp_path)
     assert not report.ok
@@ -44,7 +61,8 @@ def test_checks_without_a_fixture_are_skipped(tmp_path: Path) -> None:
         {"valid": {"method": "echo", "params": {"text": "hi"}}},
         root=tmp_path,
     )
-    assert report.ok, report.describe()
+    assert not report.ok
+    assert all(result.status != "fail" for result in report.results), report.describe()
     skipped = {result.name for result in report.results if result.status == "skip"}
     expected_skips = {
         "cancel mid-call",
@@ -76,6 +94,8 @@ def test_report_describes_each_result(tmp_path: Path) -> None:
     assert "handshake agreement" in text
     assert "SKIP" in text
     assert f"{len(report.skipped)} skipped" in text
+    assert "not run, so the report is not ok: cancel mid-call" in text
+    assert "heartbeat cadence" in text.split("not run, so the report is not ok:")[1]
 
 
 def named(report: ConformanceReport, name: str) -> CheckResult:
@@ -106,7 +126,7 @@ def test_a_secret_stored_in_a_checkpoint_fails_the_secrets_check(tmp_path: Path)
     report = run_conformance(SamplePlugin, "sample.v1", fixtures, root=tmp_path)
     result = named(report, "secrets only in the secrets object")
     assert result.status == "fail"
-    assert "secret" in result.detail
+    assert result.detail == "the worker sent the secret in a body chunk"
 
 
 def test_cancel_check_requires_the_cancel_frame_to_be_written(

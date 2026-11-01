@@ -154,6 +154,7 @@ class FakeHost:
         self._stdout_chunks: list[bytes] = []
         self._reserve_counter = 0
         self._op_counter = 0
+        self._deadline: float | None = None
         self._closed = False
 
     # ----- lifecycle ------------------------------------------------------
@@ -213,7 +214,7 @@ class FakeHost:
             thread.daemon = True
             thread.start()
 
-        self._reader = FrameReader(self._read_worker)
+        self._reader = FrameReader(self._read_worker)  # the handshake uses the default limits
         self._send(
             {
                 "t": "hello",
@@ -234,6 +235,8 @@ class FakeHost:
         frame = self._next_frame()
         if frame is not None and frame.get("t") == "hello_ack":
             self.hello_ack = frame
+            # The host's limits are the ones the worker accepted in hello.
+            self._reader = FrameReader(self._read_worker, limits=self.limits)
             return frame
         return None
 
@@ -298,12 +301,15 @@ class FakeHost:
         op: str | None = None,
         on_frame: Callable[[FakeHost, dict[str, Any]], None] | None = None,
         after_send: Callable[[FakeHost], None] | None = None,
+        deadline: float | None = None,
     ) -> CallOutcome:
         """Send one call and answer the worker until it returns a result or an error.
 
         ``on_frame`` sees every frame from the worker during the call.
         ``after_send`` runs once the call frame and its body are written, which
-        is the place to start a timer that cancels the call.
+        is the place to start a timer that cancels the call. ``deadline`` is an
+        absolute ``time.monotonic()`` value that bounds every frame read of the
+        call together. A read that reaches it raises ``TimeoutError``.
         """
         operation = op or self.new_operation_id()
         frame: dict[str, Any] = {
@@ -320,8 +326,19 @@ class FakeHost:
         self._send(frame, body)
         if after_send is not None:
             after_send(self)
-        request_length = len(body or b"")
+        self._deadline = deadline
+        try:
+            return self._exchange(operation, started, len(body or b""), on_frame)
+        finally:
+            self._deadline = None
 
+    def _exchange(
+        self,
+        operation: str,
+        started: float,
+        request_length: int,
+        on_frame: Callable[[FakeHost, dict[str, Any]], None] | None,
+    ) -> CallOutcome:
         while True:
             try:
                 incoming = self._next_frame()
@@ -362,9 +379,13 @@ class FakeHost:
                 return self._outcome(operation, "error", incoming, None, started, "")
 
     def cancel(self, op: str, *, abandon: bool = False) -> None:
-        """Send a cancel for ``op``. Safe to call from another thread."""
-        self.cancel_times[op] = time.monotonic()
+        """Send a cancel for ``op``. Safe to call from another thread.
+
+        The time is recorded once the frame is written, so a cancel that could
+        not be written has no time.
+        """
         self._send({"t": "cancel", "op": op, "abandon": abandon})
+        self.cancel_times[op] = time.monotonic()
 
     def send_shutdown(self) -> None:
         self._send({"t": "shutdown", "op": ""})
@@ -416,8 +437,14 @@ class FakeHost:
     def _read_worker(self, count: int) -> bytes:
         if self._out_fd is None:
             return b""
-        ready, _, _ = select.select([self._out_fd], [], [], self.timeout)
+        deadline = self._deadline
+        wait = self.timeout
+        if deadline is not None:
+            wait = max(0.0, min(wait, deadline - time.monotonic()))
+        ready, _, _ = select.select([self._out_fd], [], [], wait)
         if not ready:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("the call did not end before its deadline")
             raise TimeoutError(f"the worker sent nothing for {self.timeout} seconds")
         return os.read(self._out_fd, count)
 
