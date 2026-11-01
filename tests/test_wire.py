@@ -199,7 +199,7 @@ def test_nesting_of_30000_levels_is_refused_on_decode() -> None:
     depth = 30_000
     payload = b'{"t":"progress","op":"op-1","message":' + b"[" * depth + b"]" * depth + b"}"
     assert len(payload) < CONTROL_FRAME_BYTES
-    with pytest.raises(FrameError):
+    with pytest.raises(FrameError, match="frame nests deeper than 64 levels"):
         decode_payload(payload)
 
 
