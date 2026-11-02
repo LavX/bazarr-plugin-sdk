@@ -837,7 +837,7 @@ def serve(plugin_class: type[Plugin]) -> int:
       malformed, not open or a directory, or the class sets no ``kind_api``),
       when standard output cannot be redirected to standard error, or when a
       read fails on the frame or standard input descriptor.
-    - 76 on a protocol error.
+    - 76 on a protocol error, or on any other failure of the frame reader.
     - 78 when the host asks for a protocol or a kind this worker does not serve.
 
     After shutdown begins the worker has two seconds to finish. When it does
