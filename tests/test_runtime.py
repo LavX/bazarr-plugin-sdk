@@ -646,10 +646,10 @@ def test_hello_ack_that_cannot_be_encoded_exits_76(
     try:
         worker = _Worker(SamplePlugin, -1, ack_write)
 
-        def refuse_write(data: bytes) -> None:
+        def refuse_encode(*args: Any, **kwargs: Any) -> bytes:
             raise FrameError("the acknowledgement cannot be encoded")
 
-        monkeypatch.setattr(worker._writer, "write", refuse_write)
+        monkeypatch.setattr("bazarr_plugin_sdk.runtime.encode_frame", refuse_encode)
         handshake = FrameReader(io.BytesIO(hello_frame(tmp_path)).read)
         assert worker._handshake(handshake) == 76
     finally:
