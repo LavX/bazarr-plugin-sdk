@@ -72,6 +72,28 @@ with its traceback tail.
 Secrets reach `options` and `test` as the `secrets` argument and `translate`
 as `request["secrets"]`, for that call only.
 
+## Files inside the sandbox
+
+A worker runs in a sandbox that refuses calls which change file metadata:
+`chmod`, `chown`, `utime` and the extended attribute calls fail with `EPERM`.
+Several standard library functions use them without saying so, and fail in a
+worker: `shutil.copy`, `copy2`, `copymode`, `copystat`, `copytree`,
+`shutil.move` across filesystems, `Path.touch` on an existing file and
+`venv.create`. Use `bazarr_plugin_sdk.fs` instead:
+
+| Instead of | Use |
+| --- | --- |
+| `shutil.copy`, `shutil.copy2` | `fs.copy_file(src, dst)` |
+| `shutil.copytree` | `fs.copy_tree(src, dst)` |
+| `shutil.move` | `fs.move(src, dst)` |
+| `Path.touch()` | `fs.touch(path)` |
+| `Path.write_text`, `write_bytes` | `fs.write_file(path, data)` (also atomic) |
+
+They move bytes and names only, so a copy gets the default mode of a new file
+and never the mode, owner or times of its source. Writing and renaming inside the
+plugin's data and temp folders works as usual. Do not create virtual
+environments or run installers from a worker.
+
 ## Testing
 
 ```python

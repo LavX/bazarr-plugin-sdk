@@ -236,7 +236,7 @@ def test_shutdown_cancels_running_calls_and_says_bye():
 
 def test_the_worker_ends_when_the_host_closes_the_pipe():
     host = host_for(plugins.Echo)
-    host._files[1].close()
+    host._close_file(1)
     deadline = time.monotonic() + 3
     while host.exit_code is None and time.monotonic() < deadline:
         time.sleep(0.05)
