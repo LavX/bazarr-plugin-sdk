@@ -254,3 +254,14 @@ def test_secret_values_are_scrubbed_from_a_plugin_error_and_an_unhandled_one():
         crash = host.request("translate", {"request": {"kind": "crash"}}, {"key": "sk-very-secret"}).error
     assert planned["code"] == "auth_required" and "sk-very-secret" not in str(planned) and "***" in planned["message"]
     assert "sk-very-secret" not in str(crash) and "***" in crash["traceback"]
+
+
+def test_a_worker_with_room_for_one_request_never_answers_busy_to_a_back_to_back_host():
+    class One(plugins.Echo):
+        max_in_flight = 1
+
+    with host_for(One) as host:
+        for _ in range(200):
+            assert host.request("describe").ok
+        for _ in range(50):
+            assert host.request("validate", {"config": {"bad": 1}}).code == "invalid_config"
