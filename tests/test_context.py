@@ -16,12 +16,14 @@ class FakeOperation:
         self.progress_calls = []
         self.calls = []
         self.answer = {"hold": "hold-1"}
+        self.cancellable = []
 
     def progress(self, fraction=None, message=None, data=None):
         self.progress_calls.append({"fraction": fraction, "message": message, "data": data})
 
-    def call(self, name, params=None, timeout=60.0):
+    def call(self, name, params=None, timeout=60.0, cancellable=True):
         self.calls.append((name, params))
+        self.cancellable.append(cancellable)
         if isinstance(self.answer, Exception):
             raise self.answer
         return self.answer
@@ -118,3 +120,21 @@ def test_the_folders_come_from_the_environment(monkeypatch, tmp_path):
     monkeypatch.delenv("BAZARR_PLUGIN_TEMP_DIR", raising=False)
     ctx, _ = make()
     assert ctx.data_dir == tmp_path / "d" and ctx.temp_dir is None
+
+
+def test_only_a_reserve_gives_up_when_the_host_cancels():
+    ctx, operation = make()
+    ctx.reserve_sync(1, "m")
+    ctx.usage_sync(1, 1.0, "m", ["h"])
+    ctx.checkpoint_sync({})
+    assert operation.cancellable == [True, False, False]
+
+
+def test_a_host_call_cut_short_by_a_cancel_is_a_cancelled_plugin_error():
+    from bazarr_plugin_sdk._protocol.worker_channel import OperationCancelled
+
+    ctx, operation = make()
+    operation.answer = OperationCancelled("cancelled")
+    with pytest.raises(PluginError) as caught:
+        ctx.reserve_sync(1, "m")
+    assert caught.value.code == "cancelled"
