@@ -246,3 +246,11 @@ def test_the_worker_ends_when_the_host_closes_the_pipe():
 
 def test_error_codes_a_plugin_raises_are_all_in_the_vocabulary():
     assert {"rate_limited", "declined", "invalid_config"} <= ERROR_CODES
+
+
+def test_secret_values_are_scrubbed_from_a_plugin_error_and_an_unhandled_one():
+    with host_for(plugins.Leaky) as host:
+        planned = host.request("translate", {"request": {"kind": "plugin"}}, {"key": "sk-very-secret"}).error
+        crash = host.request("translate", {"request": {"kind": "crash"}}, {"key": "sk-very-secret"}).error
+    assert planned["code"] == "auth_required" and "sk-very-secret" not in str(planned) and "***" in planned["message"]
+    assert "sk-very-secret" not in str(crash) and "***" in crash["traceback"]

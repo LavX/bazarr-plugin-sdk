@@ -142,6 +142,14 @@ class Slow(Echo):
         return {"slept": True}
 
 
+class Leaky(Echo):
+    async def translate(self, request, ctx):
+        key = request["secrets"]["key"]
+        if request["kind"] == "plugin":
+            raise PluginError("auth_required", f"the key {key} was refused")
+        raise RuntimeError(f"bad key {key}")
+
+
 class Stubborn(Echo):
     """Sleeps in a thread and never looks at the cancel flag."""
 

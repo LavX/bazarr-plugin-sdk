@@ -64,11 +64,22 @@ log = logging.getLogger("bazarr_plugin_sdk.runner")
 class SdkChannel(WorkerChannel):
     """The reference channel, with failed responses that keep a plugin error's parts."""
 
-    def _respond_error(self, req_id: int, error: BaseException) -> None:
+    def _respond_error(self, req_id: int, error: BaseException, operation: Operation | None = None) -> None:
         if isinstance(error, PluginError):
-            self._send({"t": frames.RES, "id": req_id, "ok": False, "error": error.to_dict()})
+            payload = error.to_dict()
+            # The request's secret values never leave the worker in an error, as in the base class.
+            secrets = sorted(
+                (v for v in (operation.secrets.values() if operation else ()) if isinstance(v, str) and v),
+                key=len,
+                reverse=True,
+            )
+            for key in ("message", "traceback", "reason"):
+                if isinstance(payload.get(key), str):
+                    for secret in secrets:
+                        payload[key] = payload[key].replace(secret, "***")
+            self._send({"t": frames.RES, "id": req_id, "ok": False, "error": payload})
         else:
-            super()._respond_error(req_id, error)
+            super()._respond_error(req_id, error, operation)
 
 
 class PluginWorker:
