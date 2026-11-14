@@ -195,3 +195,83 @@ def test_a_written_file_is_flushed_before_the_rename(tmp_path, monkeypatch):
     fs.write_file(tmp_path / "f", "x")
     fs.copy_file(tmp_path / "f", tmp_path / "g")
     assert events == ["fsync", "replace", "fsync", "replace"]
+
+
+def test_a_rewritten_file_keeps_the_mode_of_the_file_it_replaces(tmp_path):
+    target = tmp_path / "t"
+    target.write_text("old")
+    os.chmod(target, 0o640)
+    fs.write_file(target, "new")
+    assert target.read_text() == "new" and (target.stat().st_mode & 0o777) == 0o640
+    source = tmp_path / "s"
+    source.write_text("copy")
+    os.chmod(target, 0o600)
+    fs.copy_file(source, target)
+    assert target.read_text() == "copy" and (target.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.fixture
+def across_filesystems(monkeypatch):
+    """Every rename between directories fails as it does across filesystems; renames of our temporaries work."""
+    real_replace = os.replace
+
+    def replace(src, dst):
+        if str(src).endswith(".part"):
+            return real_replace(src, dst)
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "replace", replace)
+
+
+def test_a_link_moves_as_a_link_across_filesystems(tmp_path, across_filesystems):
+    (tmp_path / "file").write_text("data")
+    (tmp_path / "dir").mkdir()
+    for name, pointing_at in (("to_file", "file"), ("to_dir", "dir"), ("dangling", "nowhere")):
+        os.symlink(pointing_at, tmp_path / name)
+        fs.move(tmp_path / name, tmp_path / f"moved_{name}")
+        assert not os.path.lexists(tmp_path / name)
+        assert os.readlink(tmp_path / f"moved_{name}") == pointing_at
+    assert (tmp_path / "file").read_text() == "data"
+
+
+def test_a_tree_with_links_moves_across_filesystems(tmp_path, across_filesystems):
+    tree = tmp_path / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "f").write_text("deep")
+    os.symlink("sub", tree / "to_dir")
+    os.symlink("sub/f", tree / "to_file")
+    os.symlink("gone", tree / "dangling")
+    fs.move(tree, tmp_path / "moved")
+    moved = tmp_path / "moved"
+    assert not tree.exists() and (moved / "sub" / "f").read_text() == "deep"
+    assert [os.readlink(moved / n) for n in ("to_dir", "to_file", "dangling")] == ["sub", "sub/f", "gone"]
+
+
+def test_copy_tree_without_symlinks_copies_what_they_point_at(tmp_path):
+    tree = tmp_path / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "f").write_text("deep")
+    os.symlink("sub", tree / "to_dir")
+    os.symlink("sub/f", tree / "to_file")
+    fs.copy_tree(tree, tmp_path / "copy", symlinks=False)
+    assert (tmp_path / "copy" / "to_dir" / "f").read_text() == "deep"
+    assert not (tmp_path / "copy" / "to_file").is_symlink() and (tmp_path / "copy" / "to_file").read_text() == "deep"
+
+
+def test_a_named_pipe_in_a_tree_is_reported_without_hanging_and_the_rest_is_copied(tmp_path, across_filesystems):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "a").write_text("kept")
+    os.mkfifo(tree / "pipe")
+    (tree / "z").write_text("also kept")
+    with pytest.raises(shutil.Error) as caught:
+        fs.copy_tree(tree, tmp_path / "copy")
+    assert [entry[0] for entry in caught.value.args[0]] == [str(tree / "pipe")]
+    assert (tmp_path / "copy" / "a").read_text() == "kept" and (tmp_path / "copy" / "z").read_text() == "also kept"
+    # a move must not delete a source it could not copy whole
+    with pytest.raises(shutil.Error):
+        fs.move(tree, tmp_path / "moved")
+    assert (tree / "a").exists() and os.path.lexists(tree / "pipe")
+    with pytest.raises(shutil.SpecialFileError):
+        fs.copy_file(tree / "pipe", tmp_path / "out")
+    assert not (tmp_path / "out").exists()

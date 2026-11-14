@@ -75,6 +75,7 @@ class Interruptible(Echo):
 
 class WatchesEvent(Echo):
     async def translate(self, request, ctx):
+        ctx.heartbeat()  # tells the test the request is running
         await ctx.cancelled.wait()
         await asyncio.sleep(0)
         return {"unreachable": False}
@@ -154,6 +155,7 @@ class Stubborn(Echo):
     """Sleeps in a thread and never looks at the cancel flag."""
 
     def translate(self, request, ctx):
+        ctx.heartbeat()  # tells the test the request is running
         time.sleep(120)
         return {}
 

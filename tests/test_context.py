@@ -147,3 +147,8 @@ def test_a_secret_across_the_progress_cut_is_scrubbed_before_the_cut():
     message = operation.progress_calls[0]["message"]
     assert "sk-prog" not in message and message.startswith("x" * 490 + "***")
     assert len(message) <= 500
+
+
+def test_the_wire_operation_is_not_a_public_attribute():
+    ctx, operation = make()
+    assert not hasattr(ctx, "operation") and ctx._operation is operation

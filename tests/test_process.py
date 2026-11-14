@@ -70,8 +70,11 @@ def test_a_request_in_flight_survives_a_noisy_neighbour():
 
 def test_a_plugin_thread_that_ignores_the_shutdown_cannot_keep_a_finished_worker_alive():
     host = start("Stubborn")
-    host.submit("translate", {"request": {}})
-    time.sleep(0.3)
+    response = host.submit("translate", {"request": {}})
+    deadline = time.monotonic() + 10
+    while not response.progress:
+        assert time.monotonic() < deadline, "the request never started"
+        time.sleep(0.01)
     host.process.stdin.close()
     assert host.process.wait(20) == 0
     host.close()

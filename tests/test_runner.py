@@ -11,6 +11,14 @@ from bazarr_plugin_sdk.testing import HostFailure, LoopbackHost
 from tests.fixtures import plugins
 
 
+def wait_until(condition, timeout=10.0):
+    """Poll until ``condition()`` holds. A limit that only a hang can reach, not a timing margin."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never held"
+        time.sleep(0.01)
+
+
 def host_for(plugin_class, **options):
     host = LoopbackHost(plugin_class, **options)
     host.wait_ready()
@@ -141,7 +149,7 @@ def test_nothing_is_sent_after_a_reserve_until_it_is_acknowledged():
 
     with host_for(plugins.Spender, host_calls={"reserve": slow_reserve}) as host:
         response = host.submit("translate", {"request": {}})
-        time.sleep(0.4)
+        wait_until(lambda: [name for _, name, _ in host.calls] == ["reserve"] and response.progress)
         # progress "start" and the reserve call only: the "sent" report waits for the answer
         assert [p["data"]["done"] for p in response.progress if p.get("data")] == [0]
         assert [name for _, name, _ in host.calls] == ["reserve"]
@@ -172,26 +180,25 @@ def test_cancel_stops_an_async_request_and_it_starts_no_new_spending():
         while not host.calls and time.monotonic() < deadline:
             time.sleep(0.01)
         host.cancel(response)
-        assert response.wait(3).code == "cancelled"
-        time.sleep(0.2)
+        assert response.wait(10).code == "cancelled"
+        assert host.request("describe").ok  # answered after anything the cancelled request might still send
         assert [name for _, name, _ in host.calls] == ["reserve"]
-        assert host.request("describe").ok
 
 
 def test_cancel_sets_the_event_for_code_that_watches_it():
     with host_for(plugins.WatchesEvent) as host:
         response = host.submit("translate", {"request": {}})
-        time.sleep(0.2)
+        wait_until(lambda: response.progress)
         host.cancel(response)
-        assert response.wait(3).code == "cancelled"
+        assert response.wait(10).code == "cancelled"
 
 
 def test_cancel_reaches_a_blocking_request_through_the_flag():
     with host_for(plugins.Blocking) as host:
         response = host.submit("translate", {"request": {}})
-        time.sleep(0.1)
+        wait_until(lambda: response.progress)
         host.cancel(response)
-        assert response.wait(3).code == "cancelled"
+        assert response.wait(10).code == "cancelled"
 
 
 def test_a_blocking_request_can_use_the_host_calls_from_its_thread():
@@ -208,38 +215,37 @@ def test_the_budget_param_reaches_the_context_and_is_not_an_argument():
 
 def test_calls_run_concurrently_up_to_the_limit_and_the_worker_refuses_more():
     with host_for(plugins.Slow) as host:
-        a = host.submit("translate", {"request": {"seconds": 0.5}})
-        b = host.submit("translate", {"request": {"seconds": 0.5}})
+        a = host.submit("translate", {"request": {"seconds": 60}})
+        b = host.submit("translate", {"request": {"seconds": 60}})
+        # The worker takes a request's slot before it reads the next frame, so a and b hold both.
         c = host.submit("translate", {"request": {"seconds": 0.0}})
-        begun = time.monotonic()
-        assert c.wait().code == "busy"
-        assert a.wait().ok and b.wait().ok
-        assert time.monotonic() - begun < 0.9
+        assert c.wait(10).code == "busy"
+        assert not a.done.is_set() and not b.done.is_set()
+        host.cancel(a)
+        host.cancel(b)
+        assert a.wait(10).code == "cancelled" and b.wait(10).code == "cancelled"
 
 
 def test_the_worker_heartbeats_on_its_own_while_idle():
     with host_for(plugins.Echo, heartbeat_interval=0.05) as host:
-        time.sleep(0.5)
-        assert len(host.heartbeats) >= 3
+        wait_until(lambda: len(host.heartbeats) >= 3)
         assert host.heartbeats[0]["in_flight"] == 0
 
 
 def test_shutdown_cancels_running_calls_and_says_bye():
     host = host_for(plugins.WatchesEvent)
     response = host.submit("translate", {"request": {}})
-    time.sleep(0.2)
+    wait_until(lambda: response.progress)
     host.shutdown()
-    assert response.wait(5).code == "cancelled"
-    assert host.bye.wait(5)
+    assert response.wait(10).code == "cancelled"
+    assert host.bye.wait(10)
     assert host.close() == 0
 
 
 def test_the_worker_ends_when_the_host_closes_the_pipe():
     host = host_for(plugins.Echo)
     host._close_file(1)
-    deadline = time.monotonic() + 3
-    while host.exit_code is None and time.monotonic() < deadline:
-        time.sleep(0.05)
+    wait_until(lambda: host.exit_code is not None)
     assert host.exit_code == 0
     host.close()
 
@@ -292,3 +298,77 @@ def test_a_worker_with_room_for_one_request_never_answers_busy_to_a_back_to_back
             assert host.request("describe").ok
         for _ in range(50):
             assert host.request("validate", {"config": {"bad": 1}}).code == "invalid_config"
+
+
+def test_a_task_a_request_leaves_running_is_cancelled_and_allowed_to_clean_up():
+    import asyncio
+    import threading
+
+    from bazarr_plugin_sdk.runner import _run_coroutine
+
+    cleaned = threading.Event()
+
+    async def background():
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cleaned.set()
+
+    async def request():
+        asyncio.get_running_loop().create_task(background())
+        await asyncio.sleep(0)
+        return "done"
+
+    class Operation:
+        cancelled = threading.Event()
+        cancel_reason = None
+
+    assert _run_coroutine(Operation(), None, request()) == "done"
+    assert cleaned.is_set()
+
+
+def test_a_thread_that_will_not_finish_cannot_hold_the_loop_shutdown(monkeypatch):
+    import asyncio
+    import threading
+
+    from bazarr_plugin_sdk import runner
+
+    monkeypatch.setattr(runner, "SHUTDOWN_TIMEOUT", 0.3)
+    release = threading.Event()
+
+    class Operation:
+        cancelled = threading.Event()
+        cancel_reason = None
+
+    async def request():
+        asyncio.get_running_loop().run_in_executor(None, release.wait, 60)
+        await asyncio.sleep(0.05)
+        return "done"
+
+    try:
+        started = time.monotonic()
+        assert runner._run_coroutine(Operation(), None, request()) == "done"
+        assert time.monotonic() - started < 30  # not the 60 seconds the thread would take
+    finally:
+        release.set()
+
+
+def _start_runner(*args):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import bazarr_plugin_sdk
+
+    bootstrap = Path(bazarr_plugin_sdk.__file__).parent / "_bootstrap.py"
+    return subprocess.run([sys.executable, "-I", str(bootstrap), *args], capture_output=True, timeout=60)
+
+
+def test_a_bad_command_line_exits_64_and_writes_nothing_to_the_frame_pipe():
+    result = _start_runner("--bogus")
+    assert result.returncode == 64 and result.stdout == b"" and b"usage" in result.stderr
+
+
+def test_help_goes_to_stderr_not_the_frame_pipe():
+    result = _start_runner("--help")
+    assert result.returncode == 0 and result.stdout == b"" and b"--entry" in result.stderr
