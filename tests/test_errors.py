@@ -63,3 +63,9 @@ def test_a_scrubber_runs_before_the_text_is_cut():
     assert "SECRET" not in str(data)
     assert data["message"].endswith("***") and data["reason"] == "*** here"
     assert len(data["traceback"]) == 8000 and data["traceback"].endswith("***bbbb")
+
+
+def test_field_names_are_scrubbed_too():
+    error = PluginError("invalid_config", "bad", field_errors={"key-SECRET-VALUE": "the value SECRET-VALUE"})
+    data = error.to_dict(lambda text: text.replace("SECRET-VALUE", "***"))
+    assert data["field_errors"] == {"key-***": "the value ***"}

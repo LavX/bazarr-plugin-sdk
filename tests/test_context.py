@@ -138,3 +138,12 @@ def test_a_host_call_cut_short_by_a_cancel_is_a_cancelled_plugin_error():
     with pytest.raises(PluginError) as caught:
         ctx.reserve_sync(1, "m")
     assert caught.value.code == "cancelled"
+
+
+def test_a_secret_across_the_progress_cut_is_scrubbed_before_the_cut():
+    ctx, operation = make()
+    operation._channel = type("Channel", (), {"_secret_values": {"sk-progress-secret"}, "_lock": threading.Lock()})()
+    ctx.progress(1, 2, "x" * 490 + "sk-progress-secret and more")
+    message = operation.progress_calls[0]["message"]
+    assert "sk-prog" not in message and message.startswith("x" * 490 + "***")
+    assert len(message) <= 500

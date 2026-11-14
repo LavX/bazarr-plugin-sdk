@@ -135,3 +135,63 @@ def test_move_copies_and_removes_when_the_rename_crosses_filesystems(tmp_path, s
 def test_move_passes_other_errors_on(tmp_path, sandboxed):
     with pytest.raises(FileNotFoundError):
         fs.move(tmp_path / "missing", tmp_path / "x")
+
+
+def _race(monkeypatch, tmp_path, fail_second=False):
+    """Two writers to one target, held at their rename until both have a temporary file."""
+    import threading
+
+    real_replace = os.replace
+    gate = threading.Barrier(2, timeout=10)
+    seen = []
+    lock = threading.Lock()
+
+    def replace(src, dst):
+        with lock:
+            seen.append(str(src))
+        gate.wait()
+        if fail_second and threading.current_thread().name == "writer-b":
+            raise OSError(errno.EIO, "refused")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    target = tmp_path / "dest.txt"
+    outcomes = {}
+
+    def write(name, text):
+        try:
+            outcomes[name] = fs.write_file(target, text)
+        except BaseException as error:
+            outcomes[name] = error
+
+    threads = [threading.Thread(target=write, args=(n, n * 10), name=f"writer-{n}") for n in "ab"]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(15)
+    return target, outcomes, seen
+
+
+def test_concurrent_writers_of_one_target_never_share_a_temporary_file(tmp_path, monkeypatch):
+    target, outcomes, seen = _race(monkeypatch, tmp_path)
+    assert len(set(seen)) == 2
+    assert all(not isinstance(value, BaseException) for value in outcomes.values()), outcomes
+    assert target.read_text() in {"a" * 10, "b" * 10}
+    assert [p.name for p in tmp_path.iterdir()] == ["dest.txt"]
+
+
+def test_a_failed_writer_removes_only_its_own_temporary_file(tmp_path, monkeypatch):
+    target, outcomes, seen = _race(monkeypatch, tmp_path, fail_second=True)
+    assert isinstance(outcomes["b"], OSError) and outcomes["a"] == target
+    assert target.read_text() == "a" * 10
+    assert [p.name for p in tmp_path.iterdir()] == ["dest.txt"]
+
+
+def test_a_written_file_is_flushed_before_the_rename(tmp_path, monkeypatch):
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace", lambda a, b: (events.append("replace"), real_replace(a, b))[1])
+    fs.write_file(tmp_path / "f", "x")
+    fs.copy_file(tmp_path / "f", tmp_path / "g")
+    assert events == ["fsync", "replace", "fsync", "replace"]

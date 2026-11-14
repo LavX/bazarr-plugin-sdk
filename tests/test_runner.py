@@ -272,6 +272,17 @@ def test_a_plugin_error_is_scrubbed_of_a_secret_an_earlier_request_carried():
     assert error["code"] == "auth_required" and "sk-earlier-secret" not in str(error) and "***" in error["message"]
 
 
+def test_a_secret_in_a_field_name_does_not_leave_the_worker():
+    class Names(plugins.Echo):
+        async def translate(self, request, ctx):
+            key = request["secrets"]["key"]
+            raise PluginError("invalid_config", "bad", field_errors={f"field {key}": "wrong"})
+
+    with host_for(Names) as host:
+        error = host.request("translate", {"request": {}}, {"key": "sk-field-secret"}).error
+    assert "sk-field-secret" not in str(error) and error["field_errors"] == {"field ***": "wrong"}
+
+
 def test_a_worker_with_room_for_one_request_never_answers_busy_to_a_back_to_back_host():
     class One(plugins.Echo):
         max_in_flight = 1
