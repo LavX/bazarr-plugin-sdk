@@ -70,7 +70,7 @@ def test_unknown_operations_and_wrong_arguments_are_errors_not_crashes():
         assert host.request("nope").code == "unknown_op"
         assert host.request("validate", {"wrong": 1}).code == "invalid_request"
         assert host.request("translate", {"request": "not an object"}).code == "invalid_request"
-        assert host.request("validate", {"config": {}}, {"s": 1}).ok  # secrets are ignored where not taken
+        assert host.request("validate", {"config": {}}, {"s": "x"}).ok  # secrets are ignored where not taken
         assert host.request("describe").ok
 
 
@@ -254,6 +254,22 @@ def test_secret_values_are_scrubbed_from_a_plugin_error_and_an_unhandled_one():
         crash = host.request("translate", {"request": {"kind": "crash"}}, {"key": "sk-very-secret"}).error
     assert planned["code"] == "auth_required" and "sk-very-secret" not in str(planned) and "***" in planned["message"]
     assert "sk-very-secret" not in str(crash) and "***" in crash["traceback"]
+
+
+def test_a_plugin_error_is_scrubbed_of_a_secret_an_earlier_request_carried():
+    class Remembers(plugins.Leaky):
+        kept = ""
+
+        async def translate(self, request, ctx):
+            if request["kind"] == "keep":
+                type(self).kept = request["secrets"]["key"]
+                return {}
+            raise PluginError("auth_required", f"the key {type(self).kept} was refused")
+
+    with host_for(Remembers) as host:
+        assert host.request("translate", {"request": {"kind": "keep"}}, {"key": "sk-earlier-secret"}).ok
+        error = host.request("translate", {"request": {"kind": "plugin"}}).error
+    assert error["code"] == "auth_required" and "sk-earlier-secret" not in str(error) and "***" in error["message"]
 
 
 def test_a_worker_with_room_for_one_request_never_answers_busy_to_a_back_to_back_host():

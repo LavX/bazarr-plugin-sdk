@@ -54,3 +54,12 @@ def test_the_traceback_is_kept_and_cut_to_its_tail():
     error.detail = "a" * 20000 + "END"
     assert len(error.to_dict()["traceback"]) == 8000
     assert PluginError.from_dict(error.to_dict()).detail.endswith("END")
+
+
+def test_a_scrubber_runs_before_the_text_is_cut():
+    error = PluginError("internal", "x" * 1990 + "SECRET-VALUE", reason="SECRET-VALUE here")
+    error.detail = "a" * 9000 + "SECRET-VALUE" + "b" * 4
+    data = error.to_dict(lambda text: text.replace("SECRET-VALUE", "***"))
+    assert "SECRET" not in str(data)
+    assert data["message"].endswith("***") and data["reason"] == "*** here"
+    assert len(data["traceback"]) == 8000 and data["traceback"].endswith("***bbbb")
