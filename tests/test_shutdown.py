@@ -17,6 +17,8 @@ from bazarr_plugin_sdk.testing import LoopbackHost
 from tests.fixtures import plugins
 
 BUDGET = 0.5
+# The shipped values, before the fixture below shortens the budget for the other tests.
+SHIPPED_BUDGET = runner.SHUTDOWN_TIMEOUT + runner.CLEANUP_SLACK
 LIMIT = 20
 
 
@@ -72,7 +74,7 @@ def test_a_worker_answers_a_call_that_ignored_its_cancel_then_exits_and_runs_not
 
 def test_a_request_that_stops_in_time_leaves_the_worker_running():
     with host_for(plugins.Stalls) as host:
-        assert host.request("translate", {"request": {"step": "leftover_task"}}, wait=LIMIT).ok
+        assert host.request("translate", {"request": {"step": "clean"}}, wait=LIMIT).ok
         assert host.request("describe", wait=LIMIT).ok
         assert host.exit_code is None
 
@@ -92,13 +94,28 @@ def test_a_plain_method_that_ignores_its_cancel_is_answered_as_cancelled():
         assert response.wait(LIMIT).code == "cancelled"
 
 
+def assert_retired(host):
+    """The worker has answered, said goodbye, ended with the retire status and refuses new calls."""
+    assert wait_for_exit(host) == runner.EXIT_ABANDONED
+    assert host.bye.wait(LIMIT)
+    try:
+        late = host.submit("describe")
+        assert late.wait(LIMIT).code in {"shutting_down", "worker_exited"}
+    except (OSError, ValueError):
+        pass  # the pipe is already closed: nothing can run
+
+
 @pytest.mark.parametrize(
-    "step", ["leftover_task", "open_generator", "blocking_generator", "stuck_executor"]
+    "step", ["leftover_task", "open_generator", "blocking_generator", "stuck_executor", "to_thread"]
 )
-def test_a_cleanup_step_that_stalls_does_not_hold_the_result(step):
-    with host_for(plugins.Stalls) as host:
+def test_a_cleanup_step_that_stalls_still_answers_and_then_retires_the_worker(step):
+    host = host_for(plugins.Stalls)
+    try:
         response = host.request("translate", {"request": {"step": step}}, wait=LIMIT)
-        assert response.value == {"ended": step}
+        assert response.value == {"ended": step}  # the result is not lost
+        assert_retired(host)
+    finally:
+        host.close()
 
 
 def test_a_settle_call_the_host_never_answers_does_not_hold_a_cancelled_request():
@@ -194,3 +211,9 @@ def test_the_channel_lock_is_reentrant_for_the_filter_and_the_loop_handler():
             channel._lock.release()
     finally:
         host.close()
+
+
+def test_the_whole_cleanup_budget_is_well_under_the_hosts_cancel_grace():
+    # The host kills a worker that has not answered a cancel within its cancel_grace (5 seconds in
+    # provider_hub/runtime/session.py). The reply comes at most this long after a cancel.
+    assert SHIPPED_BUDGET <= 4.0

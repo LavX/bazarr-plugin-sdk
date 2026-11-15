@@ -266,6 +266,8 @@ class Stalls(Echo):
             await generator.__anext__()
         elif step == "stuck_executor":
             asyncio.get_running_loop().run_in_executor(None, RELEASE.wait, 120)
+        elif step == "to_thread":
+            asyncio.get_running_loop().create_task(asyncio.to_thread(RELEASE.wait, 120))
         elif step == "all_three":
             asyncio.get_running_loop().create_task(self._swallow())
             generator = self._generator(blocking=False)
