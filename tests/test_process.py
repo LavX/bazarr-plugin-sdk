@@ -78,3 +78,10 @@ def test_a_plugin_thread_that_ignores_the_shutdown_cannot_keep_a_finished_worker
     host.process.stdin.close()
     assert host.process.wait(20) == 0
     host.close()
+
+
+def test_a_large_list_result_arrives_as_a_list_from_a_real_worker():
+    with start("BigShapes") as host:
+        response = host.request("translate", {"request": {"shape": "list"}}, wait=60)
+    assert response.result == {"json_in_data": True}
+    assert isinstance(response.value, list) and len(response.value) == 60000

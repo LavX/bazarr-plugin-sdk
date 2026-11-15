@@ -305,3 +305,19 @@ def test_a_link_that_cannot_be_read_leaves_the_destination_alone(tmp_path):
         fs.copy_link(tmp_path / "src", tmp_path / "dir")  # a directory with content cannot be replaced
     assert (tmp_path / "dir" / "inside").read_text() == "1"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["dir", "dst", "src"]  # no temporary link left
+
+
+def test_a_tree_is_not_copied_into_itself(tmp_path):
+    tree = tmp_path / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "f").write_text("x")
+    for inside in (tree / "backup", tree / "sub" / "deeper", tree):
+        with pytest.raises(shutil.Error, match="into itself"):
+            fs.copy_tree(tree, inside, dirs_exist_ok=True)
+    os.symlink(tree, tmp_path / "alias")
+    with pytest.raises(shutil.Error, match="into itself"):
+        fs.copy_tree(tree, tmp_path / "alias" / "backup")
+    assert sorted(p.name for p in tree.iterdir()) == ["sub"] and not (tree / "sub" / "deeper").exists()
+    fs.copy_tree(tree, tmp_path / "tree2")  # a neighbour is fine, and so is a folder that only shares a prefix
+    fs.copy_tree(tree, tmp_path / "tree-backup")
+    assert (tmp_path / "tree-backup" / "sub" / "f").read_text() == "x"

@@ -442,3 +442,39 @@ def test_the_executor_shutdown_is_bounded_where_the_loop_cannot_bound_it(monkeyp
         assert result == ["done"]
     finally:
         release.set()
+
+
+def test_a_task_that_swallows_its_cancel_cannot_hold_the_request(monkeypatch, caplog):
+    import asyncio
+    import threading
+
+    from bazarr_plugin_sdk import runner
+
+    monkeypatch.setattr(runner, "SHUTDOWN_TIMEOUT", 0.3)
+    stubborn_ran = threading.Event()
+
+    async def stubborn():
+        while True:
+            try:
+                stubborn_ran.set()
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                pass  # swallows every cancel
+
+    async def request():
+        asyncio.get_running_loop().create_task(stubborn())
+        await asyncio.sleep(0.05)
+        return "done"
+
+    class Operation:
+        cancelled = threading.Event()
+        cancel_reason = None
+
+    result = []
+    worker = threading.Thread(target=lambda: result.append(runner._run_coroutine(Operation(), None, request())), daemon=True)
+    with caplog.at_level("WARNING", logger="bazarr_plugin_sdk.runner"):
+        worker.start()
+        worker.join(30)
+    assert not worker.is_alive(), "a task that swallows its cancel held the request"
+    assert result == ["done"] and stubborn_ran.is_set()
+    assert "ignored its cancel" in caplog.text
