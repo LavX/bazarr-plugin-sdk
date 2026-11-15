@@ -183,3 +183,77 @@ class Broken:
 class Exploding(Echo):
     def __init__(self):
         raise RuntimeError("constructor failed")
+
+
+# Whatever the stalling plugins below wait on; a test sets it when it is done.
+RELEASE = threading.Event()
+_KEPT = []
+
+
+class Stalls(Echo):
+    """A request that stalls in one step of ending or being cancelled, named by ``request["step"]``."""
+
+    async def translate(self, request, ctx):
+        step = request["step"]
+        ctx.heartbeat()  # tells the test the request is running
+        if step == "swallows_cancel":
+            while True:
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    pass
+        if step == "blocks_the_loop":
+            RELEASE.wait(120)
+            return {}
+        if step == "settle_after_cancel":
+            try:
+                await asyncio.sleep(120)
+            finally:
+                await ctx.usage(1, 0.1, "m", [])
+        if step == "leftover_task":
+            asyncio.get_running_loop().create_task(self._swallow())
+        elif step == "open_generator":
+            generator = self._generator(blocking=False)
+            _KEPT.append(generator)
+            await generator.__anext__()
+        elif step == "blocking_generator":
+            generator = self._generator(blocking=True)
+            _KEPT.append(generator)
+            await generator.__anext__()
+        elif step == "stuck_executor":
+            asyncio.get_running_loop().run_in_executor(None, RELEASE.wait, 120)
+        elif step == "all_three":
+            asyncio.get_running_loop().create_task(self._swallow())
+            generator = self._generator(blocking=False)
+            _KEPT.append(generator)
+            await generator.__anext__()
+            asyncio.get_running_loop().run_in_executor(None, RELEASE.wait, 120)
+        await asyncio.sleep(0.05)
+        return {"ended": step}
+
+    @staticmethod
+    async def _swallow():
+        while True:
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                pass
+
+    @staticmethod
+    async def _generator(blocking):
+        try:
+            yield 1
+        finally:
+            if blocking:
+                RELEASE.wait(120)
+            else:
+                await asyncio.sleep(120)
+
+
+class StallsSync(Echo):
+    """A plain method that ignores its cancel."""
+
+    def translate(self, request, ctx):
+        ctx.heartbeat()
+        RELEASE.wait(120)
+        return {}
