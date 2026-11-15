@@ -107,6 +107,24 @@ def test_a_small_result_is_inline_and_a_large_one_travels_as_data_frames():
     assert len(large.value["lines"]) == 1500
 
 
+def test_a_large_list_or_scalar_result_comes_back_as_it_is():
+    with host_for(plugins.BigShapes) as host:
+        as_list = host.request("translate", {"request": {"shape": "list"}}, wait=30)
+        as_text = host.request("translate", {"request": {"shape": "text"}}, wait=30)
+        as_dict = host.request("translate", {"request": {"shape": "dict"}}, wait=30)
+    for response in (as_list, as_text, as_dict):
+        assert response.result == {"json_in_data": True} and response.data
+    assert isinstance(as_list.value, list) and len(as_list.value) == 60000 and as_list.value[1] == "line 1" * 5
+    assert as_text.value == "x" * 700_000
+    assert set(as_dict.value) == {"value", "other"}
+
+
+def test_the_data_of_a_large_non_object_result_is_the_json_of_the_result_itself():
+    packed = pack_result(["z" * INLINE_RESULT_BYTES])
+    assert isinstance(packed, OperationResult) and json.loads(packed.data) == ["z" * INLINE_RESULT_BYTES]
+    assert json.loads(pack_result("z" * INLINE_RESULT_BYTES).data) == "z" * INLINE_RESULT_BYTES
+
+
 def test_pack_result_switches_at_the_inline_limit():
     assert pack_result({"a": 1}) == {"a": 1}
     assert pack_result([1]) == {"value": [1]}
@@ -372,3 +390,55 @@ def test_a_bad_command_line_exits_64_and_writes_nothing_to_the_frame_pipe():
 def test_help_goes_to_stderr_not_the_frame_pipe():
     result = _start_runner("--help")
     assert result.returncode == 0 and result.stdout == b"" and b"--entry" in result.stderr
+
+
+def test_the_executor_shutdown_is_bounded_where_the_loop_cannot_bound_it(monkeypatch):
+    """Python 3.10 and 3.11 join the executor threads without a limit, even when cancelled."""
+    import asyncio
+    import threading
+
+    from bazarr_plugin_sdk import runner
+
+    async def shutdown_without_a_limit(self):
+        self._executor_shutdown_called = True
+        executor = self._default_executor
+        if executor is None:
+            return
+        future = self.create_future()
+
+        def work():
+            try:
+                executor.shutdown(wait=True)
+                self.call_soon_threadsafe(future.set_result, None)
+            except Exception as error:
+                self.call_soon_threadsafe(future.set_exception, error)
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        try:
+            await future
+        finally:
+            thread.join()
+
+    monkeypatch.setattr(asyncio.BaseEventLoop, "shutdown_default_executor", shutdown_without_a_limit)
+    monkeypatch.setattr(runner, "SHUTDOWN_TIMEOUT", 0.3)
+    release = threading.Event()
+
+    class Operation:
+        cancelled = threading.Event()
+        cancel_reason = None
+
+    async def request():
+        asyncio.get_running_loop().run_in_executor(None, release.wait, 60)
+        await asyncio.sleep(0.05)
+        return "done"
+
+    result = []
+    runner_thread = threading.Thread(target=lambda: result.append(runner._run_coroutine(Operation(), None, request())), daemon=True)
+    try:
+        runner_thread.start()
+        runner_thread.join(30)
+        assert not runner_thread.is_alive(), "the request was held by a stuck executor thread"
+        assert result == ["done"]
+    finally:
+        release.set()

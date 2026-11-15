@@ -275,3 +275,33 @@ def test_a_named_pipe_in_a_tree_is_reported_without_hanging_and_the_rest_is_copi
     with pytest.raises(shutil.SpecialFileError):
         fs.copy_file(tree / "pipe", tmp_path / "out")
     assert not (tmp_path / "out").exists()
+
+
+def test_an_existing_link_is_never_missing_while_it_is_replaced(tmp_path, monkeypatch):
+    os.symlink("old", tmp_path / "dst")
+    os.symlink("new", tmp_path / "src")
+    real_replace = os.replace
+    seen = []
+
+    def replace(src, dst):
+        seen.append(os.path.lexists(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    fs.copy_link(tmp_path / "src", tmp_path / "dst")
+    assert seen == [True] and os.readlink(tmp_path / "dst") == "new"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["dst", "src"]
+
+
+def test_a_link_that_cannot_be_read_leaves_the_destination_alone(tmp_path):
+    (tmp_path / "dst").write_text("keep")
+    with pytest.raises(OSError):
+        fs.copy_link(tmp_path / "not-a-link", tmp_path / "dst")
+    assert (tmp_path / "dst").read_text() == "keep"
+    os.symlink("x", tmp_path / "src")
+    os.mkdir(tmp_path / "dir")
+    (tmp_path / "dir" / "inside").write_text("1")
+    with pytest.raises(OSError):
+        fs.copy_link(tmp_path / "src", tmp_path / "dir")  # a directory with content cannot be replaced
+    assert (tmp_path / "dir" / "inside").read_text() == "1"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["dir", "dst", "src"]  # no temporary link left

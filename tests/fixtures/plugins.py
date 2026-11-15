@@ -115,6 +115,17 @@ class BigResult(Echo):
         return {"lines": ["x" * 1000] * int(request["count"])}
 
 
+class BigShapes(Echo):
+    """Results that are not objects and are too large to travel inline."""
+
+    async def translate(self, request, ctx):
+        if request["shape"] == "list":
+            return ["line %d" % number * 5 for number in range(60000)]
+        if request["shape"] == "text":
+            return "x" * 700_000
+        return {"value": "y" * 700_000, "other": 1}
+
+
 class NotJson(Echo):
     async def translate(self, request, ctx):
         return {"bad": object()}
