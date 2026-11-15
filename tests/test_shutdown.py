@@ -13,6 +13,7 @@ import pytest
 
 from bazarr_plugin_sdk import runner
 from bazarr_plugin_sdk._grace import Grace
+from bazarr_plugin_sdk._result import IN_DATA
 from bazarr_plugin_sdk.testing import LoopbackHost
 from tests.fixtures import plugins
 
@@ -116,6 +117,39 @@ def test_a_cleanup_step_that_stalls_still_answers_and_then_retires_the_worker(st
         assert_retired(host)
     finally:
         host.close()
+
+
+def test_a_successful_large_result_is_delivered_whole_before_the_worker_retires():
+    host = host_for(plugins.Stalls)
+    try:
+        response = host.request("translate", {"request": {"step": "large_with_thread"}}, wait=LIMIT)
+        assert response.ok, response.error
+        assert response.result == {IN_DATA: True}  # it travelled as data frames
+        assert response.value == {"lines": ["x" * 1000] * 1500}
+        assert_retired(host)
+    finally:
+        host.close()
+
+
+def test_a_second_request_is_refused_at_once_while_the_retiring_answer_is_still_to_come():
+    from bazarr_plugin_sdk.runner import SdkChannel
+
+    channel = host_for(plugins.Echo)
+    try:
+        worker = channel.worker.channel
+        assert isinstance(worker, SdkChannel)
+
+        class Op:
+            id = 99
+
+        worker.retire(runner.EXIT_ABANDONED, Op())
+        late = channel.submit("describe")
+        assert late.wait(LIMIT).code == "shutting_down"
+        assert not worker._ended.is_set()  # not ended until that answer is written
+        worker._forget(Op())
+        assert wait_for_exit(channel) == runner.EXIT_ABANDONED
+    finally:
+        channel.close()
 
 
 def test_a_settle_call_the_host_never_answers_does_not_hold_a_cancelled_request():
