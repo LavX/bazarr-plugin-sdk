@@ -164,6 +164,12 @@ class LeaksOnCancel(Echo):
         return {"ok": True}
 
 
+class Surrogate(Echo):
+    async def translate(self, request, ctx):
+        ctx.progress(1, 2, "half \ud800 way")
+        return {"ok": True}
+
+
 class NotJson(Echo):
     async def translate(self, request, ctx):
         return {"bad": object()}
@@ -291,7 +297,10 @@ class Stalls(Echo):
 class StallsSync(Echo):
     """A plain method that ignores its cancel."""
 
+    started = []
+
     def translate(self, request, ctx):
+        type(self).started.append(1)
         ctx.heartbeat()
         RELEASE.wait(120)
         return {}
