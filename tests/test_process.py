@@ -4,6 +4,7 @@ import os
 import time
 from pathlib import Path
 
+from bazarr_plugin_sdk._result import IN_DATA
 from bazarr_plugin_sdk.testing import ProcessHost
 
 ROOT = str(Path(__file__).resolve().parent.parent)
@@ -83,5 +84,15 @@ def test_a_plugin_thread_that_ignores_the_shutdown_cannot_keep_a_finished_worker
 def test_a_large_list_result_arrives_as_a_list_from_a_real_worker():
     with start("BigShapes") as host:
         response = host.request("translate", {"request": {"shape": "list"}}, wait=60)
-    assert response.result == {"json_in_data": True}
+    assert response.result == {IN_DATA: True}
     assert isinstance(response.value, list) and len(response.value) == 60000
+
+
+def test_a_secret_never_reaches_the_worker_stderr_through_a_log_record_or_a_cleanup_exception():
+    host = start("LeaksOnCancel")
+    try:
+        assert host.request("translate", {"request": {"log": True}}, {"key": "sk-process-secret"}).ok
+    finally:
+        host.close()
+    assert "sk-process-secret" not in host.stderr_text
+    assert "bad key ***" in host.stderr_text and "using ***" in host.stderr_text

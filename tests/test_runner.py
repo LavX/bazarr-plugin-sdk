@@ -6,6 +6,7 @@ import pytest
 from bazarr_plugin_sdk import ERROR_CODES
 from bazarr_plugin_sdk.runner import INLINE_RESULT_BYTES, build_plugin, pack_result
 from bazarr_plugin_sdk._protocol.worker_channel import OperationResult
+from bazarr_plugin_sdk._result import IN_DATA, WRAPPED
 from bazarr_plugin_sdk.errors import PluginError
 from bazarr_plugin_sdk.testing import HostFailure, LoopbackHost
 from tests.fixtures import plugins
@@ -62,7 +63,7 @@ def test_operations_and_their_arguments():
 def test_a_list_result_travels_as_a_value():
     with host_for(plugins.Echo) as host:
         response = host.request("options", {"field": "f", "config": {}}, {"key": "k1"})
-    assert response.result == {"value": [{"value": "f", "secret_seen": "k1"}]}
+    assert response.result == {WRAPPED: [{"value": "f", "secret_seen": "k1"}]}
     assert response.value == [{"value": "f", "secret_seen": "k1"}]
 
 
@@ -103,7 +104,7 @@ def test_a_small_result_is_inline_and_a_large_one_travels_as_data_frames():
         small = host.request("translate", {"request": {"count": 3}})
         assert small.data == b"" and len(small.value["lines"]) == 3
         large = host.request("translate", {"request": {"count": 1500}})
-    assert large.result == {"json_in_data": True} and large.data
+    assert large.result == {IN_DATA: True} and large.data
     assert len(large.value["lines"]) == 1500
 
 
@@ -113,7 +114,7 @@ def test_a_large_list_or_scalar_result_comes_back_as_it_is():
         as_text = host.request("translate", {"request": {"shape": "text"}}, wait=30)
         as_dict = host.request("translate", {"request": {"shape": "dict"}}, wait=30)
     for response in (as_list, as_text, as_dict):
-        assert response.result == {"json_in_data": True} and response.data
+        assert response.result == {IN_DATA: True} and response.data
     assert isinstance(as_list.value, list) and len(as_list.value) == 60000 and as_list.value[1] == "line 1" * 5
     assert as_text.value == "x" * 700_000
     assert set(as_dict.value) == {"value", "other"}
@@ -127,7 +128,7 @@ def test_the_data_of_a_large_non_object_result_is_the_json_of_the_result_itself(
 
 def test_pack_result_switches_at_the_inline_limit():
     assert pack_result({"a": 1}) == {"a": 1}
-    assert pack_result([1]) == {"value": [1]}
+    assert pack_result([1]) == {WRAPPED: [1]}
     packed = pack_result({"x": "y" * INLINE_RESULT_BYTES})
     assert isinstance(packed, OperationResult) and json.loads(packed.data)["x"].startswith("y")
 
@@ -478,3 +479,41 @@ def test_a_task_that_swallows_its_cancel_cannot_hold_the_request(monkeypatch, ca
     assert not worker.is_alive(), "a task that swallows its cancel held the request"
     assert result == ["done"] and stubborn_ran.is_set()
     assert "ignored its cancel" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "shape, expected",
+    [
+        ("value", {"value": 1}),
+        ("marker", {"json_in_data": True, "x": 1}),
+        ("both", {"value": 1, "json_in_data": True}),
+        ("empty", {}),
+    ],
+)
+def test_an_ordinary_result_object_is_never_unwrapped(shape, expected):
+    with host_for(plugins.Shapes) as host:
+        response = host.request("translate", {"request": {"shape": shape}})
+    assert response.result == expected and response.value == expected
+
+
+def test_a_large_object_with_a_value_field_comes_back_whole():
+    with host_for(plugins.Shapes) as host:
+        response = host.request("translate", {"request": {"shape": "large_value"}}, wait=30)
+    assert response.result == {IN_DATA: True}
+    assert response.value == {"value": "y" * 700_000}
+
+
+@pytest.mark.parametrize("key", [WRAPPED, IN_DATA])
+def test_a_result_that_uses_a_reserved_key_is_refused(key):
+    with host_for(plugins.Shapes) as host:
+        error = host.request("translate", {"request": {"shape": "reserved", "key": key}}).error
+    assert error["code"] == "internal" and error["reason"] == "reserved_key"
+
+
+def test_a_secret_in_an_exception_a_background_task_raises_on_cancel_is_not_logged(caplog):
+    with caplog.at_level("DEBUG"):
+        with host_for(plugins.LeaksOnCancel) as host:
+            response = host.request("translate", {"request": {}}, {"key": "sk-bg-secret"})
+    assert response.ok
+    assert "sk-bg-secret" not in caplog.text
+    assert "bad key ***" in caplog.text  # it was logged, cleaned

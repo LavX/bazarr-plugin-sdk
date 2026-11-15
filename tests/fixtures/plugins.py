@@ -1,6 +1,7 @@
 """Plugins the tests serve. Importable by entry (``tests.fixtures.plugins:Name``)."""
 
 import asyncio
+import logging
 import os
 import sys
 import threading
@@ -124,6 +125,43 @@ class BigShapes(Echo):
         if request["shape"] == "text":
             return "x" * 700_000
         return {"value": "y" * 700_000, "other": 1}
+
+
+class Shapes(Echo):
+    """Result objects that look like the SDK's own wrappers, or really use its keys."""
+
+    async def translate(self, request, ctx):
+        shape = request["shape"]
+        if shape == "value":
+            return {"value": 1}
+        if shape == "marker":
+            return {"json_in_data": True, "x": 1}
+        if shape == "both":
+            return {"value": 1, "json_in_data": True}
+        if shape == "empty":
+            return {}
+        if shape == "large_value":
+            return {"value": "y" * 700_000}
+        return {request["key"]: 1}
+
+
+class LeaksOnCancel(Echo):
+    """Leaves a task behind that raises the request's secret when it is cancelled, and logs it too."""
+
+    async def translate(self, request, ctx):
+        key = request["secrets"]["key"]
+        if request.get("log"):
+            logging.getLogger("tests.plugin").warning("using %s", key)
+
+        async def background():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise RuntimeError(f"bad key {key}") from None
+
+        asyncio.get_running_loop().create_task(background())
+        await asyncio.sleep(0.05)
+        return {"ok": True}
 
 
 class NotJson(Echo):
