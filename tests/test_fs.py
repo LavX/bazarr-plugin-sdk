@@ -321,3 +321,85 @@ def test_a_tree_is_not_copied_into_itself(tmp_path):
     fs.copy_tree(tree, tmp_path / "tree2")  # a neighbour is fine, and so is a folder that only shares a prefix
     fs.copy_tree(tree, tmp_path / "tree-backup")
     assert (tmp_path / "tree-backup" / "sub" / "f").read_text() == "x"
+
+
+LONG = "n" * 250  # leaves 5 characters under NAME_MAX: the old temporary name did not fit
+
+
+def test_every_helper_works_on_a_name_close_to_the_limit(tmp_path):
+    fs.write_file(tmp_path / LONG, "w")
+    assert (tmp_path / LONG).read_text() == "w"
+    fs.copy_file(tmp_path / LONG, tmp_path / (LONG[:-1] + "c"))
+    os.symlink("x", tmp_path / "link")
+    fs.copy_link(tmp_path / "link", tmp_path / (LONG[:-1] + "l"))
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    fs.write_file(tree / LONG, "t")
+    os.symlink("x", tree / (LONG[:-1] + "k"))
+    fs.copy_tree(tree, tmp_path / "copy")
+    assert (tmp_path / "copy" / LONG).read_text() == "t"
+    assert os.readlink(tmp_path / "copy" / (LONG[:-1] + "k")) == "x"
+    assert not [p for p in tmp_path.rglob("*") if p.name.endswith(".part")]
+
+
+def test_the_temporary_name_does_not_depend_on_the_target_name(tmp_path, monkeypatch):
+    opened = []
+    real_open = os.open
+
+    def recording_open(path, *args, **kwargs):
+        opened.append(os.path.basename(os.fspath(path)))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    fs.write_file(tmp_path / "a-name-that-must-not-appear", "x")
+    temp_names = [name for name in opened if name.endswith(".part")]
+    assert temp_names and all("must-not-appear" not in name and len(name) < 40 for name in temp_names)
+
+
+def test_a_read_only_or_executable_file_keeps_its_mode_when_rewritten(tmp_path):
+    for mode in (0o444, 0o755):
+        target = tmp_path / f"f{mode:o}"
+        target.write_text("old")
+        os.chmod(target, mode)
+        fs.write_file(target, "new")
+        assert target.read_text() == "new" and (target.stat().st_mode & 0o777) == mode
+
+
+def test_a_link_at_the_target_is_replaced_and_the_file_it_pointed_at_is_left_alone(tmp_path):
+    (tmp_path / "real").write_text("untouched")
+    os.symlink("real", tmp_path / "t")
+    fs.write_file(tmp_path / "t", "new")
+    assert not (tmp_path / "t").is_symlink() and (tmp_path / "t").read_text() == "new"
+    assert (tmp_path / "real").read_text() == "untouched"
+
+
+def test_a_link_back_into_the_tree_is_reported_when_links_are_followed(tmp_path):
+    tree = tmp_path / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "f").write_text("kept")
+    os.symlink("..", tree / "sub" / "loop")
+    with pytest.raises(shutil.Error) as caught:
+        fs.copy_tree(tree, tmp_path / "copy", symlinks=False)
+    assert [entry[0] for entry in caught.value.args[0]] == [str(tree / "sub" / "loop")]
+    assert (tmp_path / "copy" / "sub" / "f").read_text() == "kept"
+    fs.copy_tree(tree, tmp_path / "linked")  # as links they are plain
+    assert os.readlink(tmp_path / "linked" / "sub" / "loop") == ".."
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every folder")
+def test_a_folder_that_cannot_be_read_is_reported_after_the_rest_is_copied(tmp_path, across_filesystems):
+    tree = tmp_path / "tree"
+    (tree / "closed").mkdir(parents=True)
+    (tree / "open").mkdir()
+    (tree / "open" / "f").write_text("kept")
+    os.chmod(tree / "closed", 0)
+    try:
+        with pytest.raises(shutil.Error) as caught:
+            fs.copy_tree(tree, tmp_path / "copy")
+        assert [entry[0] for entry in caught.value.args[0]] == [str(tree / "closed")]
+        assert (tmp_path / "copy" / "open" / "f").read_text() == "kept"
+        with pytest.raises(shutil.Error):
+            fs.move(tree, tmp_path / "moved")  # a move that could not copy everything keeps the source
+        assert (tree / "open" / "f").exists()
+    finally:
+        os.chmod(tree / "closed", 0o755)
