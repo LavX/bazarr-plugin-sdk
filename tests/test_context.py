@@ -152,3 +152,19 @@ def test_a_secret_across_the_progress_cut_is_scrubbed_before_the_cut():
 def test_the_wire_operation_is_not_a_public_attribute():
     ctx, operation = make()
     assert not hasattr(ctx, "operation") and ctx._operation is operation
+
+
+def test_a_lone_surrogate_in_a_progress_message_is_replaced_not_raised():
+    ctx, operation = make()
+    ctx.progress(1, 2, "half \ud800 way")
+    assert operation.progress_calls[0]["message"] == "half ? way"
+
+
+def test_a_progress_message_with_a_surrogate_travels_through_the_real_frames():
+    from bazarr_plugin_sdk.testing import LoopbackHost
+    from tests.fixtures import plugins
+
+    with LoopbackHost(plugins.Surrogate) as host:
+        response = host.request("translate", {"request": {}})
+        assert response.ok
+        assert [p.get("message") for p in response.progress] == ["half ? way"]

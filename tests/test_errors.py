@@ -69,3 +69,16 @@ def test_field_names_are_scrubbed_too():
     error = PluginError("invalid_config", "bad", field_errors={"key-SECRET-VALUE": "the value SECRET-VALUE"})
     data = error.to_dict(lambda text: text.replace("SECRET-VALUE", "***"))
     assert data["field_errors"] == {"key-***": "the value ***"}
+
+
+def test_the_log_filter_survives_a_record_whose_arguments_do_not_fit_its_message():
+    import logging
+
+    from bazarr_plugin_sdk._scrub import SecretFilter
+
+    channel = type("Channel", (), {"_secret_values": {"sk-log-secret"}, "_lock": __import__("threading").RLock()})()
+    log_filter = SecretFilter()
+    log_filter.channel = channel
+    record = logging.LogRecord("x", logging.WARNING, __file__, 1, "key sk-log-secret and %s %s", ("only one",), None)
+    assert log_filter.filter(record) is True
+    assert "sk-log-secret" not in record.getMessage() and "***" in record.getMessage()

@@ -43,6 +43,40 @@ def host_for(plugin_class, **options):
     return host
 
 
+def wait_for_exit(host):
+    deadline = time.monotonic() + LIMIT
+    while host.exit_code is None:
+        assert time.monotonic() < deadline, "the worker never exited"
+        time.sleep(0.01)
+    return host.exit_code
+
+
+@pytest.mark.parametrize("plugin, step", [(plugins.Stalls, "swallows_cancel"), (plugins.Stalls, "blocks_the_loop"), (plugins.StallsSync, "x")])
+def test_a_worker_answers_a_call_that_ignored_its_cancel_then_exits_and_runs_nothing_beside_it(plugin, step):
+    plugins.StallsSync.started.clear()
+    host = host_for(plugin)
+    response = started(host, step)
+    host.cancel(response)
+    assert response.wait(LIMIT).code == "cancelled"
+    assert wait_for_exit(host) == runner.EXIT_ABANDONED
+    assert host.bye.wait(LIMIT)
+    # A call made now is refused or finds no worker; it never runs beside the stuck thread.
+    try:
+        late = host.submit("translate", {"request": {"step": "leftover_task"}})
+        assert late.wait(LIMIT).code in {"shutting_down", "worker_exited"}
+    except (OSError, ValueError):
+        pass
+    assert len(plugins.StallsSync.started) <= 1
+    host.close()
+
+
+def test_a_request_that_stops_in_time_leaves_the_worker_running():
+    with host_for(plugins.Stalls) as host:
+        assert host.request("translate", {"request": {"step": "leftover_task"}}, wait=LIMIT).ok
+        assert host.request("describe", wait=LIMIT).ok
+        assert host.exit_code is None
+
+
 @pytest.mark.parametrize("step", ["swallows_cancel", "blocks_the_loop"])
 def test_a_request_that_ignores_its_cancel_is_answered_as_cancelled(step):
     with host_for(plugins.Stalls) as host:
@@ -140,3 +174,23 @@ def test_the_grace_is_one_deadline_that_starts_once(monkeypatch):
     assert grace.remaining() == 3.0 and not grace.expired()
     now[0] = 108.5
     assert grace.remaining() == 0.0 and grace.expired()
+
+
+def test_the_channel_lock_is_reentrant_for_the_filter_and_the_loop_handler():
+    from bazarr_plugin_sdk._scrub import held_secrets
+
+    host = host_for(plugins.Echo)
+    channel = host.worker.channel
+    try:
+        # A finaliser may run the filter or the loop handler on a thread that holds the lock.
+        assert channel._lock.acquire(timeout=5)
+        try:
+            again = channel._lock.acquire(timeout=1)
+            if again:
+                channel._lock.release()
+            assert again, "the channel lock cannot be taken again by the thread that holds it"
+            assert held_secrets(channel) == []
+        finally:
+            channel._lock.release()
+    finally:
+        host.close()

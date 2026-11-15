@@ -403,3 +403,41 @@ def test_a_folder_that_cannot_be_read_is_reported_after_the_rest_is_copied(tmp_p
         assert (tree / "open" / "f").exists()
     finally:
         os.chmod(tree / "closed", 0o755)
+
+
+def test_touch_creates_exclusively_and_never_opens_an_existing_file_for_writing(tmp_path, monkeypatch):
+    opened = []
+    real_open = os.open
+
+    def recording_open(path, flags, *args, **kwargs):
+        opened.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    (tmp_path / "there").write_text("keep")
+    os.symlink("nowhere", tmp_path / "dangling")
+    os.mkdir(tmp_path / "folder")
+    for name in ("there", "dangling", "folder"):
+        fs.touch(tmp_path / name)
+    fs.touch(tmp_path / "new")
+    assert (tmp_path / "there").read_text() == "keep" and (tmp_path / "new").read_bytes() == b""
+    assert os.path.islink(tmp_path / "dangling") and not (tmp_path / "nowhere").exists()
+    assert opened and all(flags & os.O_EXCL and flags & os.O_CREAT for flags in opened)
+
+
+def test_move_falls_back_to_copying_when_the_sandbox_refuses_the_rename(tmp_path, monkeypatch):
+    real_replace = os.replace
+
+    def replace(src, dst):
+        if str(src).endswith(".part"):
+            return real_replace(src, dst)
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "replace", replace)
+    (tmp_path / "a").write_text("file")
+    fs.move(tmp_path / "a", tmp_path / "b")
+    assert (tmp_path / "b").read_text() == "file" and not (tmp_path / "a").exists()
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "f").write_text("deep")
+    fs.move(tmp_path / "d", tmp_path / "e")
+    assert (tmp_path / "e" / "f").read_text() == "deep" and not (tmp_path / "d").exists()
