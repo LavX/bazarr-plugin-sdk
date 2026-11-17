@@ -371,7 +371,9 @@ def _clean_up(loop: asyncio.AbstractEventLoop, grace: Grace, operation: Any = No
     """Every step after the request, each within what is left of the shared budget.
 
     The loop is closed only when every step finished; after an overrun something may
-    still be using it.
+    still be using it. A step that raises is given up on the same way as one that
+    overruns: it did not finish, so whatever it was waiting for may still be running,
+    and the worker is retired.
     """
     steps = (_cancel_remaining_tasks, _shutdown_asyncgens, _shutdown_executor)
     clean = True
@@ -383,6 +385,7 @@ def _clean_up(loop: asyncio.AbstractEventLoop, grace: Grace, operation: Any = No
             clean = finished and clean
         except Exception as error:
             log.warning("a cleanup step failed: %s", scrubbed_traceback(error, channel_secrets(operation)))
+            grace.abandon(step.__name__.lstrip("_"))
             clean = False
     if clean:
         try:

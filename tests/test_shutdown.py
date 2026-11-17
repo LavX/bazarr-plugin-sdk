@@ -119,6 +119,34 @@ def test_a_cleanup_step_that_stalls_still_answers_and_then_retires_the_worker(st
         host.close()
 
 
+def test_a_cleanup_step_that_raises_is_recorded_as_abandoned(monkeypatch):
+    def _explodes(loop, grace):
+        raise RuntimeError("the step broke")
+
+    monkeypatch.setattr(runner, "_shutdown_asyncgens", _explodes)
+    loop = asyncio.new_event_loop()
+    grace = Grace(BUDGET)
+    grace.start()
+    runner._clean_up(loop, grace)
+    assert grace.abandoned == ["explodes"]  # the steps before and after it finished and are not listed
+    assert not loop.is_closed()  # something may still be using it
+
+
+@pytest.mark.parametrize("step", ["_cancel_remaining_tasks", "_shutdown_asyncgens", "_shutdown_executor"])
+def test_a_cleanup_step_that_raises_still_answers_and_then_retires_the_worker(monkeypatch, step):
+    def explodes(loop, grace):
+        raise RuntimeError("the step broke")
+
+    monkeypatch.setattr(runner, step, explodes)
+    host = host_for(plugins.Echo)
+    try:
+        response = host.request("translate", {"request": {}}, wait=LIMIT)
+        assert response.ok, response.error  # the result is not lost
+        assert_retired(host)
+    finally:
+        host.close()
+
+
 def test_a_successful_large_result_is_delivered_whole_before_the_worker_retires():
     host = host_for(plugins.Stalls)
     try:
