@@ -72,6 +72,38 @@ with its traceback tail.
 Secrets reach `options` and `test` as the `secrets` argument and `translate`
 as `request["secrets"]`, for that call only.
 
+## Cancelling a call
+
+The host cancels one call by its request id. What that does to the call, to the
+tasks it started and to the other calls in the same worker (`max_in_flight` above 1):
+
+- **Only that call is told.** `ctx.cancelled` and `ctx.is_cancelled` change for the
+  cancelled call alone. Every call has its own context, its own thread and, for an
+  `async def` method, its own event loop, so a sibling call keeps running. State you
+  keep on `self` or at module level is shared by all calls and is never cancelled for
+  you.
+- **The call itself.** An `async def` method has its task cancelled, so `await` raises
+  `asyncio.CancelledError`. A plain method is not interrupted: it must check
+  `ctx.is_cancelled` and return, or raise. `reserve` is refused after a cancel;
+  `usage` and `checkpoint` still go out, so a call can settle its holds while it stops.
+- **What the call left behind.** Once the call has ended or been cancelled, the SDK
+  cancels the tasks it started with `create_task`, closes the async generators it left
+  open and waits for the executor threads it used (`run_in_executor`,
+  `asyncio.to_thread`). A thread cannot be interrupted, so such a thread has to end on
+  its own.
+- **One budget.** All of that, plus your own settle calls, shares one deadline of
+  3.5 seconds from the cancel, not 3.5 seconds per step. The answer goes out when the
+  work ends or the budget is spent, which is well inside the host's 5 second
+  `cancel_grace`.
+- **When something does not stop** (a task that swallows `CancelledError`, a generator
+  or thread that outlives the budget, a cleanup step that raises, a call that ignores
+  its cancel), it is left running and the worker is retired. The call is still answered
+  (as cancelled, or with its result), and the worker then refuses new calls with
+  `shutting_down`. Its sibling calls that are still running are cancelled with the
+  reason `shutdown` and get the host's shutdown grace to finish. The worker exits and
+  the host starts a fresh one. A new call never runs beside code that was told to stop
+  and did not, so catch `CancelledError` only to clean up, then let it go.
+
 ## Files inside the sandbox
 
 A worker runs in a sandbox that refuses calls which change file metadata:
