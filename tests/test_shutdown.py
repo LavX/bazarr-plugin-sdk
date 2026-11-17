@@ -127,9 +127,44 @@ def test_a_cleanup_step_that_raises_is_recorded_as_abandoned(monkeypatch):
     loop = asyncio.new_event_loop()
     grace = Grace(BUDGET)
     grace.start()
-    runner._clean_up(loop, grace)
-    assert grace.abandoned == ["explodes"]  # the steps before and after it finished and are not listed
-    assert not loop.is_closed()  # something may still be using it
+    try:
+        runner._clean_up(loop, grace)
+        assert grace.abandoned == ["explodes"]  # the steps before and after it finished and are not listed
+        assert not loop.is_closed()  # something may still be using it
+    finally:
+        loop.close()
+
+
+def test_a_cleanup_step_that_raises_something_other_than_an_exception_is_recorded_too(monkeypatch):
+    def _exits(loop, grace):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(runner, "_shutdown_asyncgens", _exits)
+    loop = asyncio.new_event_loop()
+    grace = Grace(BUDGET)
+    grace.start()
+    try:
+        runner._clean_up(loop, grace)
+        assert grace.abandoned == ["exits"]
+    finally:
+        loop.close()
+
+
+def test_an_executor_shutdown_that_fails_counts_as_a_step_that_did_not_finish(monkeypatch):
+    loop = asyncio.new_event_loop()
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("the executor would not shut down")
+
+    monkeypatch.setattr(loop, "shutdown_default_executor", broken)
+    grace = Grace(BUDGET)
+    grace.start()
+    try:
+        runner._clean_up(loop, grace)
+        assert grace.abandoned == ["shutdown_executor"]
+        assert not loop.is_closed()
+    finally:
+        loop.close()
 
 
 @pytest.mark.parametrize("step", ["_cancel_remaining_tasks", "_shutdown_asyncgens", "_shutdown_executor"])
