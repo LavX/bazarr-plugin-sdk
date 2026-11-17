@@ -310,3 +310,19 @@ class StallsSync(Echo):
         ctx.heartbeat()
         RELEASE.wait(120)
         return {}
+
+
+class StepRaises(Echo):
+    """A plugin whose worker has a first cleanup step that raises.
+
+    Nothing a plugin can do makes a step raise on its own, so the step is replaced in the
+    worker process that builds this class. Use it only in a process of its own.
+    """
+
+    def __init__(self):
+        from bazarr_plugin_sdk import runner
+
+        def _cancel_remaining_tasks(loop, grace):
+            raise RuntimeError("the step broke")
+
+        runner._cancel_remaining_tasks = _cancel_remaining_tasks
