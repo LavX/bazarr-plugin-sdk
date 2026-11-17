@@ -72,6 +72,44 @@ with its traceback tail.
 Secrets reach `options` and `test` as the `secrets` argument and `translate`
 as `request["secrets"]`, for that call only.
 
+## Cancelling a call
+
+The host cancels one call by its request id. What that does to the call, to the
+tasks it started and to the other calls in the same worker (`max_in_flight` above 1):
+
+- **Only that call is told.** `ctx.is_cancelled` changes for the cancelled call alone,
+  and so does `ctx.cancelled`, which is only ever set for an `async def` method. Every
+  call has its own context, its own thread and, for an `async def` method, its own
+  event loop, so a sibling call keeps running. State you keep on `self` or at module
+  level is shared by all calls and is never cancelled for you.
+- **The call itself.** An `async def` method has its task cancelled, so `await` raises
+  `asyncio.CancelledError`. A plain method is not interrupted: it must check
+  `ctx.is_cancelled` and return, or raise. Either way a value it returns is dropped
+  and the call is answered as cancelled. After a cancel `progress` and `heartbeat` are
+  dropped, and `reserve` and `checkpoint` raise `PluginError("cancelled")`, so state
+  has to be stored before the cancel. `usage` still goes out, so a call can settle its
+  holds while it stops. A `checkpoint` already sent before the cancel is still waited
+  for, but the answer to the host does not wait longer than the budget below.
+- **What the call left behind.** Once the call has ended or been cancelled, the SDK
+  cancels the tasks it started with `create_task`, closes the async generators it left
+  open and waits for the executor threads it used (`run_in_executor`,
+  `asyncio.to_thread`). A thread cannot be interrupted, so such a thread has to end on
+  its own. A plain method's own threads are not tracked: only the thread the method
+  runs on is.
+- **One budget.** All of that, plus your own settle calls, shares one deadline of
+  3.5 seconds, not 3.5 seconds per step. It starts at the cancel, or, for a call that
+  ended without one, when the call ends. The answer goes out when the work ends or the
+  budget is spent, which is well inside the host's 5 second `cancel_grace`.
+- **When something does not stop** (a task that swallows `CancelledError`, a generator
+  or thread that outlives the budget, a cleanup step that fails, a call that ignores
+  its cancel), it is left running and the worker is retired. The call is still answered
+  (as cancelled if it was cancelled, otherwise with its result), and the worker then
+  refuses new calls with `shutting_down`. Its sibling calls that are still running are
+  cancelled with the reason `shutdown`; each has up to 5 seconds (the worker's
+  `wait_grace`) to answer, and is also held to its own 3.5 second budget. The worker
+  exits and the host starts a fresh one. A new call never runs beside code that was
+  told to stop and did not, so catch `CancelledError` only to clean up, then let it go.
+
 ## Files inside the sandbox
 
 A worker runs in a sandbox that refuses calls which change file metadata:

@@ -4,6 +4,7 @@ import os
 import time
 from pathlib import Path
 
+from bazarr_plugin_sdk import runner
 from bazarr_plugin_sdk._result import IN_DATA
 from bazarr_plugin_sdk.testing import ProcessHost
 
@@ -96,3 +97,30 @@ def test_a_secret_never_reaches_the_worker_stderr_through_a_log_record_or_a_clea
         host.close()
     assert "sk-process-secret" not in host.stderr_text
     assert "bad key ***" in host.stderr_text and "using ***" in host.stderr_text
+
+
+def test_a_cleanup_overrun_in_a_real_worker_answers_inside_the_hosts_grace_then_retires_it():
+    # The shipped budget, not a shortened one: the worker is a separate process and the leftover
+    # thread never ends, so only the answer's timing and the exit status show what happened.
+    host = start("Stalls")
+    try:
+        begun = time.monotonic()
+        response = host.request("translate", {"request": {"step": "stuck_executor"}}, wait=30)
+        elapsed = time.monotonic() - begun
+        assert response.value == {"ended": "stuck_executor"}  # the result is not lost
+        assert elapsed < 5.0  # before the host's cancel_grace would have killed the worker
+        assert host.process.wait(20) == runner.EXIT_ABANDONED
+        assert host.bye.wait(5)
+    finally:
+        host.close()
+    assert "retiring the worker, left running: shutdown_executor" in host.stderr_text
+
+
+def test_a_cleanup_step_that_raises_in_a_real_worker_retires_it_too():
+    host = start("StepRaises")
+    try:
+        assert host.request("translate", {"request": {}}, wait=30).ok
+        assert host.process.wait(20) == runner.EXIT_ABANDONED
+    finally:
+        host.close()
+    assert "retiring the worker, left running: cancel_remaining_tasks" in host.stderr_text
